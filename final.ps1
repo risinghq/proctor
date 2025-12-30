@@ -5,7 +5,8 @@
 # ============================================================================
 $CONFIG = @{
     NetworkShareBase   = "\\192.168.5.30\sidera\Examenes"
-    UsernameTemplate   = "Dispositivo {0:D2}"
+    UsernameTemplate   = "Alumno-{0:D2}"
+    FolderTemplate     = "Dispositivo {0:D2}"
     StudentPassword    = "alumno"
     TotalStudents      = 30
     PollInterval       = 30
@@ -71,7 +72,8 @@ do {
 } while ($true)
 
 $UserName = $CONFIG.UsernameTemplate -f $StudentNum
-$NetworkFolder = "$($CONFIG.NetworkShareBase)\$UserName"
+$FolderName = $CONFIG.FolderTemplate -f $StudentNum
+$NetworkFolder = "$($CONFIG.NetworkShareBase)\$FolderName"
 
 Write-Log "User: $UserName"
 Write-Log "Network: $NetworkFolder"
