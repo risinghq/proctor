@@ -73,7 +73,7 @@ function Set-EdgePolicies {
     }
     
     $policies = @{
-        'DeveloperToolsAvailability' = 2
+        # 'DeveloperToolsAvailability' = 2
         'PrintingEnabled' = 0
         'AllowFileSelectionDialogs' = 0
         'DownloadRestrictions' = 3
