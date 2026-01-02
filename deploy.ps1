@@ -84,6 +84,45 @@ function Get-UserSID {
     return $user.Translate([System.Security.Principal.SecurityIdentifier]).Value
 }
 
+function Grant-BatchJobLogonRight {
+    param($username, $sid)
+    
+    try {
+        $tempFile = [System.IO.Path]::GetTempFileName()
+        
+        & secedit /export /cfg $tempFile /quiet
+        
+        $content = Get-Content $tempFile
+        $batchLine = $content | Where-Object { $_ -match '^SeBatchLogonRight' }
+        
+        if ($batchLine) {
+            if ($batchLine -notmatch "\*$sid") {
+                $newLine = $batchLine + ",*$sid"
+                $content = $content -replace [regex]::Escape($batchLine), $newLine
+            } else {
+                Remove-Item $tempFile -Force
+                return $true
+            }
+        } else {
+            $content += ""
+            $content += "[Privilege Rights]"
+            $content += "SeBatchLogonRight = *$sid"
+        }
+        
+        Set-Content -Path $tempFile -Value $content -Force
+        
+        & secedit /configure /db secedit.sdb /cfg $tempFile /quiet
+        
+        Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+        Remove-Item "secedit.sdb" -Force -ErrorAction SilentlyContinue
+        
+        return $true
+    } catch {
+        Write-Warning "No se pudo otorgar derecho de batch job: $($_.Exception.Message)"
+        return $false
+    }
+}
+
 function Set-EdgePolicies {
     param($sid)
     
@@ -477,6 +516,13 @@ if (Enable-TaskSchedulerHistory) {
 
 Write-Host "Obteniendo SID de usuario..." -ForegroundColor Yellow
 $sid = Get-UserSID $alumno.Name
+
+Write-Host "Otorgando derechos de batch job..." -ForegroundColor Yellow
+if (Grant-BatchJobLogonRight $alumno.Name $sid) {
+    Write-Host "  Derechos otorgados correctamente" -ForegroundColor Gray
+} else {
+    Write-Host "  Advertencia: No se pudieron otorgar derechos de batch job" -ForegroundColor DarkYellow
+}
 
 Write-Host "Configurando politicas de Edge..." -ForegroundColor Yellow
 Set-EdgePolicies $sid
