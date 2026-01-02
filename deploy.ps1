@@ -56,6 +56,27 @@ function Create-FolderStructure {
     }
 }
 
+function Enable-TaskSchedulerHistory {
+    try {
+        $logStatus = & wevtutil get-log Microsoft-Windows-TaskScheduler/Operational | Select-String "enabled:"
+        
+        if ($logStatus -match "enabled:\s*false") {
+            & wevtutil set-log Microsoft-Windows-TaskScheduler/Operational /enabled:true /quiet
+            
+            $verifyStatus = & wevtutil get-log Microsoft-Windows-TaskScheduler/Operational | Select-String "enabled:"
+            if ($verifyStatus -match "enabled:\s*true") {
+                return $true
+            }
+        } elseif ($logStatus -match "enabled:\s*true") {
+            return $true
+        }
+    } catch {
+        Write-Warning "No se pudo habilitar el historial de tareas: $($_.Exception.Message)"
+        return $false
+    }
+    return $false
+}
+
 function Get-UserSID {
     param($username)
     
@@ -446,6 +467,13 @@ if (!(Confirm-Installation $alumno.Name $dispositivo)) {
 
 Write-Host "Creando estructura de carpetas..." -ForegroundColor Yellow
 Create-FolderStructure
+
+Write-Host "Habilitando historial de tareas programadas..." -ForegroundColor Yellow
+if (Enable-TaskSchedulerHistory) {
+    Write-Host "  Historial de tareas habilitado correctamente" -ForegroundColor Gray
+} else {
+    Write-Host "  Advertencia: No se pudo habilitar el historial de tareas" -ForegroundColor DarkYellow
+}
 
 Write-Host "Obteniendo SID de usuario..." -ForegroundColor Yellow
 $sid = Get-UserSID $alumno.Name
