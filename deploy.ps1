@@ -365,7 +365,7 @@ function Create-ScheduledTask {
     
     $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -File `"$kiosk-path\sync-exam.ps1`""
     $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Seconds 30) -RepetitionDuration ([TimeSpan]::MaxValue)
-    $principal = New-ScheduledTaskPrincipal -UserId $username -LogonType ServiceAccount
+    $principal = New-ScheduledTaskPrincipal -UserId $username -LogonType S4U -RunLevel Limited
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
     
     Register-ScheduledTask -TaskName $task-name -Action $action -Trigger $trigger -Principal $principal -Settings $settings | Out-Null
