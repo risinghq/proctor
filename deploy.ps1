@@ -90,31 +90,50 @@ function Grant-BatchJobLogonRight {
     try {
         $tempFile = [System.IO.Path]::GetTempFileName()
         
-        & secedit /export /cfg $tempFile /quiet
+        $result = & secedit /export /cfg $tempFile /quiet 2>&1
+        
+        if (!(Test-Path $tempFile) -or (Get-Item $tempFile).Length -eq 0) {
+            throw "secedit export failed: $result"
+        }
+        
+        Start-Sleep -Milliseconds 500
         
         $content = Get-Content $tempFile
         $batchLine = $content | Where-Object { $_ -match '^SeBatchLogonRight' }
         
         if ($batchLine) {
-            if ($batchLine -notmatch "\*$sid") {
+            if ($batchLine -notmatch [regex]::Escape("*$sid")) {
                 $newLine = $batchLine + ",*$sid"
                 $content = $content -replace [regex]::Escape($batchLine), $newLine
             } else {
-                Remove-Item $tempFile -Force
+                Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
                 return $true
             }
         } else {
-            $content += ""
-            $content += "[Privilege Rights]"
-            $content += "SeBatchLogonRight = *$sid"
+            $privilegeSection = $false
+            $newContent = @()
+            foreach ($line in $content) {
+                $newContent += $line
+                if ($line -match '^\[Privilege Rights\]') {
+                    $privilegeSection = $true
+                    $newContent += "SeBatchLogonRight = *$sid"
+                }
+            }
+            if (-not $privilegeSection) {
+                $newContent += ""
+                $newContent += "[Privilege Rights]"
+                $newContent += "SeBatchLogonRight = *$sid"
+            }
+            $content = $newContent
         }
         
-        Set-Content -Path $tempFile -Value $content -Force
+        Set-Content -Path $tempFile -Value $content -Force -Encoding Unicode
         
-        & secedit /configure /db secedit.sdb /cfg $tempFile /quiet
+        $dbFile = Join-Path $env:TEMP "secedit_$([guid]::NewGuid().ToString()).sdb"
+        & secedit /configure /db $dbFile /cfg $tempFile /quiet
         
         Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
-        Remove-Item "secedit.sdb" -Force -ErrorAction SilentlyContinue
+        Remove-Item $dbFile -Force -ErrorAction SilentlyContinue
         
         return $true
     } catch {
