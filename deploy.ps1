@@ -336,58 +336,54 @@ function New-SyncScript {
 `$kioskPath = "C:\Kiosk"
 `$logsPath = "`$kioskPath\Logs"
 `$networkPath = "$networkPath"
+`$localPdf = "`$kioskPath\Exam.pdf"
 `$logFile = "`$logsPath\sync_`$(Get-Date -Format 'yyyyMMdd').log"
 
 function Write-Log {
     param([string]`$level, [string]`$message)
     `$timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    `$entry = "[`$timestamp] [`$level] `$message"
-    Add-Content -Path `$logFile -Value `$entry
+    Add-Content -Path `$logFile -Value "[`$timestamp] [`$level] `$message"
 }
 
-function Get-MostRecentPDF {
-    param(`$path)
+function Get-NetworkPDF {
+    if (!(Test-Path `$networkPath)) { return `$null }
     
-    if (!(Test-Path `$path)) {
-        return `$null
-    }
-    
-    `$pdfs = Get-ChildItem -Path `$path -Filter "*.pdf" -ErrorAction SilentlyContinue
-    
-    if (`$pdfs.Count -eq 0) {
-        return `$null
-    }
+    `$pdfs = Get-ChildItem -Path `$networkPath -Filter "*.pdf" -ErrorAction SilentlyContinue
+    if (`$pdfs.Count -eq 0) { return `$null }
     
     return `$pdfs | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 }
 
-function Sync-ExamPDF {
-    Write-Log "INFO" "Sincronizacion iniciada"
-    
+# Mirror local state to network state
+`$networkPdf = Get-NetworkPDF
+
+if (`$null -eq `$networkPdf) {
+    if (Test-Path `$localPdf) {
+        Remove-Item `$localPdf -Force
+        Write-Log "INFO" "PDF local eliminado (red vacia)"
+    }
+    exit 0
+}
+
+# Network has PDF, check if we need to copy
+`$needsCopy = `$false
+
+if (!(Test-Path `$localPdf)) {
+    `$needsCopy = `$true
+} else {
+    `$localHash = (Get-FileHash `$localPdf -Algorithm MD5).Hash
+    `$networkHash = (Get-FileHash `$networkPdf.FullName -Algorithm MD5).Hash
+    `$needsCopy = `$localHash -ne `$networkHash
+}
+
+if (`$needsCopy) {
     try {
-        `$networkPdf = Get-MostRecentPDF `$networkPath
-        `$localPdf = "`$kioskPath\Exam.pdf"
-        
-        if (`$null -eq `$networkPdf) {
-            if (Test-Path `$localPdf) {
-                Remove-Item `$localPdf -Force
-                Write-Log "INFO" "PDF local eliminado (no hay PDF en red)"
-            }
-            return
-        }
-        
-        `$modified = `$networkPdf.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')
-        Write-Log "INFO" "PDF encontrado: `$(`$networkPdf.Name) (Modificado: `$modified)"
-        
         Copy-Item -Path `$networkPdf.FullName -Destination `$localPdf -Force
-        Write-Log "INFO" "PDF sincronizado exitosamente"
-        
+        Write-Log "INFO" "PDF sincronizado: `$(`$networkPdf.Name)"
     } catch {
         Write-Log "ERROR" "Fallo en sincronizacion: `$(`$_.Exception.Message)"
     }
 }
-
-Sync-ExamPDF
 "@
     
     $syncPath = "$kioskPath\sync-exam.ps1"
@@ -404,14 +400,11 @@ function New-IndexHTML {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Examen para certificacion</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { 
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; 
-            background: linear-gradient(135deg, #f5f5f5 0%, #e8e8e8 100%);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; 
+            background: #f5f5f5;
             color: #1a1a1a; 
             height: 100vh; 
             display: flex; 
@@ -419,61 +412,41 @@ function New-IndexHTML {
             justify-content: center; 
             align-items: center; 
             user-select: none;
-            -webkit-user-select: none;
             overflow: hidden;
         }
-        .student-badge {
+        .badge {
             position: absolute;
             top: 24px;
             right: 24px;
             background: rgba(0, 0, 0, 0.05);
-            backdrop-filter: blur(10px);
             border: 1px solid rgba(0, 0, 0, 0.1);
             padding: 10px 20px;
             border-radius: 6px;
             font-weight: 600;
             font-size: 0.9rem;
-            letter-spacing: 0.5px;
             color: #4a4a4a;
         }
-        .waiting-container {
+        .waiting {
             display: flex;
             flex-direction: column;
             align-items: center;
             gap: 2rem;
-            max-width: 600px;
             text-align: center;
         }
-        h1 { 
-            font-weight: 700; 
-            font-size: 2.5rem; 
-            letter-spacing: -0.5px; 
-            margin-bottom: 0.5rem; 
-            color: #000000;
-        }
-        p { 
-            font-weight: 400; 
-            font-size: 1rem; 
-            color: #5a5a5a; 
-            letter-spacing: 0.01em; 
-            line-height: 1.6;
-        }
+        h1 { font-weight: 700; font-size: 2.5rem; color: #000; }
+        p { font-size: 1rem; color: #5a5a5a; }
         .loader { 
             width: 40px; 
             height: 40px; 
             border: 3px solid rgba(0, 0, 0, 0.1);
-            border-top: 3px solid #4a4a4a; 
+            border-top-color: #4a4a4a; 
             border-radius: 50%; 
             animation: spin 1s linear infinite; 
-            margin-top: 1rem;
         }
         .status { 
-            font-weight: 500; 
             font-size: 0.85rem; 
             color: #6a6a6a; 
-            letter-spacing: 0.3px;
             animation: pulse 2s ease-in-out infinite;
-            margin-top: 0.5rem;
         }
         iframe { 
             position: absolute; 
@@ -485,97 +458,44 @@ function New-IndexHTML {
             background: #fff; 
             display: none; 
         }
-        @keyframes spin { 
-            0% { transform: rotate(0deg); } 
-            100% { transform: rotate(360deg); } 
-        }
-        @keyframes pulse {
-            0%, 100% { opacity: 0.4; }
-            50% { opacity: 1; }
-        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes pulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
     </style>
 </head>
 <body oncontextmenu="return false;">
-    <div class="student-badge">$username</div>
-    <div class="waiting-container" id="waiting">
+    <div class="badge">$username</div>
+    <div class="waiting" id="waiting">
         <h1>Examen para certificación</h1>
         <p>Por favor, espere las instrucciones del docente para comenzar el examen</p>
         <div class="loader"></div>
         <div class="status">Esperando examen...</div>
     </div>
-    <iframe id="pdfFrame" src="about:blank"></iframe>
+    <iframe id="pdf"></iframe>
     
     <script>
-        const iframe = document.getElementById('pdfFrame');
+        const iframe = document.getElementById('pdf');
         const waiting = document.getElementById('waiting');
-        let pdfExists = false;
-        let isChecking = false;
+        let pollInterval = null;
         
-        console.log('[INIT] Page loaded - starting PDF monitoring system');
-        
-        // Main iframe load handler - uses contentWindow.length to detect PDF
         iframe.onload = function() {
-            console.log('[ONLOAD] Iframe loaded, src:', iframe.src);
+            if (iframe.src === '' || iframe.src === 'about:blank') return;
             
-            // Ignore about:blank
-            if (iframe.src.includes('about:blank')) {
-                console.log('[ONLOAD] about:blank detected - skipping');
-                return;
-            }
-            
-            // Wait for iframe to fully render
             setTimeout(function() {
-                const length = iframe.contentWindow.length;
-                console.log('[ONLOAD] contentWindow.length:', length);
-                
-                if (length === 1) {
-                    // PDF loaded successfully
-                    console.log('[ONLOAD] PDF detected - showing');
+                if (iframe.contentWindow.length === 1) {
                     iframe.style.display = 'block';
                     waiting.style.display = 'none';
-                    pdfExists = true;
-                } else {
-                    // Error page (PDF missing)
-                    console.log('[ONLOAD] PDF missing - showing waiting screen');
-                    iframe.style.display = 'none';
-                    waiting.style.display = 'flex';
-                    pdfExists = false;
+                    clearInterval(pollInterval);
+                    pollInterval = null;
                 }
-                
-                isChecking = false;
             }, 100);
         };
         
-        // Error handler - fires when iframe fails to load (backup detection)
-        iframe.onerror = function() {
-            console.log('[ONERROR] Iframe error event - PDF missing');
-            iframe.style.display = 'none';
-            waiting.style.display = 'flex';
-            pdfExists = false;
-            isChecking = false;
-        };
-        
-        // Check function - reloads iframe to detect changes
-        function checkPDF() {
-            if (isChecking) {
-                console.log('[CHECK] Already checking - skipping');
-                return;
-            }
-            
-            console.log('[CHECK] Checking for PDF (current state: pdfExists =', pdfExists + ')');
-            isChecking = true;
-            
-            // Reload with cache-busting timestamp
-            iframe.src = 'Exam.pdf?t=' + Date.now() + '#toolbar=0&navpanes=0&scrollbar=0';
+        function checkForPDF() {
+            iframe.src = 'Exam.pdf?t=' + Date.now() + '#toolbar=0&navpanes=0';
         }
         
-        // Start checking immediately
-        checkPDF();
-        
-        // Check every 5 seconds
-        setInterval(checkPDF, 5000);
-        
-        console.log('[INIT] Monitoring started - checking every 5 seconds');
+        checkForPDF();
+        pollInterval = setInterval(checkForPDF, 5000);
     </script>
 </body>
 </html>
