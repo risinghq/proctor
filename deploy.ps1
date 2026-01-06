@@ -11,12 +11,12 @@ function Get-AlumnoUser {
   $users = Get-LocalUser | Where-Object { $_.Name -match '^Alumno-\d{2}$' }
 
   if ($users.Count -eq 0) {
-    Write-Error "ERROR: No se encontro ningun usuario Alumno-XX"
+    Write-Error "ERROR: No se encontró ningún usuario Alumno-XX"
     exit 1
   }
 
   if ($users.Count -gt 1) {
-    Write-Error "ERROR: Se encontraron multiples usuarios Alumno:"
+    Write-Error "ERROR: Se encontraron múltiples usuarios Alumno:"
     $users | ForEach-Object { Write-Information "  - $($_.Name)" }
     exit 1
   }
@@ -31,7 +31,7 @@ function Get-DispositivoNumber {
     return $matches[1]
   }
 
-  Write-Error "ERROR: No se pudo extraer numero de dispositivo de $username"
+  Write-Error "ERROR: No se pudo extraer número de dispositivo de $username"
   exit 1
 }
 
@@ -42,7 +42,7 @@ function Confirm-Installation {
   Write-Information "Usuario encontrado: $username"
   Write-Information "Dispositivo: $dispositivo"
   Write-Information ""
-  $response = Read-Host "Confirmar instalacion? (Y/N)"
+  $response = Read-Host "Confirmar instalación? (Y/N)"
 
   return $response -eq 'Y'
 }
@@ -161,13 +161,13 @@ function Set-EdgePolicy {
     $userProfile = (Get-CimInstance Win32_UserProfile | Where-Object { $_.LocalPath -like "*\$username" }).LocalPath
 
     if (-not $userProfile) {
-      throw "No se encontro el perfil para $username"
+      throw "No se encontró el perfil para $username"
     }
 
     $ntUserPath = Join-Path $userProfile "NTUSER.DAT"
 
     if (-not (Test-Path $ntUserPath)) {
-      throw "No se encontro NTUSER.DAT en $userProfile"
+      throw "No se encontró NTUSER.DAT en $userProfile"
     }
 
     # Cargar el hive del usuario
@@ -248,13 +248,13 @@ function Set-SystemRestriction {
     $userProfile = (Get-CimInstance Win32_UserProfile | Where-Object { $_.LocalPath -like "*\$username" }).LocalPath
 
     if (-not $userProfile) {
-      throw "No se encontro el perfil para $username"
+      throw "No se encontró el perfil para $username"
     }
 
     $ntUserPath = Join-Path $userProfile "NTUSER.DAT"
 
     if (-not (Test-Path $ntUserPath)) {
-      throw "No se encontro NTUSER.DAT para $username"
+      throw "No se encontró NTUSER.DAT para $username"
     }
 
     # Cargar el hive del usuario
@@ -270,14 +270,14 @@ function Set-SystemRestriction {
     }
     Set-ItemProperty -Path $explorerPath -Name "NoRun" -Value 1 -Type DWord -Force
 
-    # Configurar restricciones de System
+    # Configurar restricciones del sistema
     $systemPath = "Registry::$hiveName\Software\Policies\Microsoft\Windows\System"
     if (!(Test-Path $systemPath)) {
       New-Item -Path $systemPath -Force | Out-Null
     }
     Set-ItemProperty -Path $systemPath -Name "DisableCMD" -Value 1 -Type DWord -Force
 
-    # Configurar restricciones de Task Manager
+    # Configurar restricciones del Task Manager (administrador de tareas)
     $policiesSystemPath = "Registry::$hiveName\Software\Microsoft\Windows\CurrentVersion\Policies\System"
     if (!(Test-Path $policiesSystemPath)) {
       New-Item -Path $policiesSystemPath -Force | Out-Null
@@ -535,7 +535,8 @@ function New-ScheduledTask {
   $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1)
   $trigger.Repetition.StopAtDurationEnd = $false
 
-  # Use ServiceAccount logon type - works without password and doesn't require batch logon rights
+  # Use ServiceAccount logon type
+  # it works without password and doesn't require batch logon rights
   $principal = New-ScheduledTaskPrincipal -UserId $username -LogonType ServiceAccount -RunLevel Limited
   $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
 
@@ -644,9 +645,7 @@ Write-Host "Desinstalacion completada" -ForegroundColor Green
   Set-Content -Path $uninstallPath -Value $uninstallScript -Force
 }
 
-# ============================================================================
 # MAIN EXECUTION
-# ============================================================================
 
 $alumno = Get-AlumnoUser
 $dispositivo = Get-DispositivoNumber $alumno.Name
