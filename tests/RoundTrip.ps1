@@ -215,7 +215,7 @@ Assert-True (@($studentRights | Where-Object { $_.FileSystemRights -match 'Write
 $credAcl = Get-Acl -Path 'C:\ProgramData\proctor\share.cred'
 $credSids = $credAcl.Access | ForEach-Object { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }
 Assert-True ($credSids.Count -eq 2 -and $credSids -contains 'S-1-5-18' -and $credSids -contains 'S-1-5-32-544') 'share.cred readable only by SYSTEM and Administrators'
-Assert-True ($credAcl.AreAccessRulesProtected) 'share.cred inherits no other ACEs'
+Assert-True ((Get-Acl -Path 'C:\ProgramData\proctor').AreAccessRulesProtected) 'proctor data folder inherits no other ACEs'
 
 $hive = Mount-UserHive -Sid $sid
 try {
