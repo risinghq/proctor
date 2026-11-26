@@ -124,6 +124,19 @@ Assert-True ($winlogon.DefaultUserName -eq $userName) 'auto-logon targets the st
 Assert-True ($null -ne (Get-NetFirewallRule -DisplayName "BlockInternet-$userName" -ErrorAction SilentlyContinue)) 'outbound block rule exists'
 Assert-True ($null -eq (Get-NetFirewallRule -DisplayName "AllowSMB-$userName" -ErrorAction SilentlyContinue)) 'no SMB allow rule for the student'
 
+# Read the hive before the probe: its logon loads the hive under HKU, and
+# handles this process opens there would keep it loaded through uninstall.
+$hive = Mount-UserHive -Sid $sid
+try {
+    Assert-True (Test-Path "$($hive.Root)\Software\Policies\Microsoft\Edge") 'Edge policies in the student hive'
+    Assert-True (Test-Path "$($hive.Root)\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer") 'Explorer restrictions in the student hive'
+    $runKey = Get-ItemProperty -Path "$($hive.Root)\Software\Microsoft\Windows\CurrentVersion\Run"
+    Assert-True ($runKey.ProctorKiosk -like '*--kiosk*') 'kiosk autorun present'
+}
+finally {
+    Dismount-UserHive -Hive $hive
+}
+
 $blockFilter = Get-NetFirewallRule -DisplayName "BlockInternet-$userName" | Get-NetFirewallSecurityFilter
 Assert-True ($blockFilter.LocalUser -match [regex]::Escape($sid)) 'block rule applies to the student SID'
 
@@ -217,16 +230,6 @@ $credSids = $credAcl.Access | ForEach-Object { $_.IdentityReference.Translate([S
 Assert-True ($credSids.Count -eq 2 -and $credSids -contains 'S-1-5-18' -and $credSids -contains 'S-1-5-32-544') 'share.cred readable only by SYSTEM and Administrators'
 Assert-True ((Get-Acl -Path 'C:\ProgramData\proctor').AreAccessRulesProtected) 'proctor data folder inherits no other ACEs'
 
-$hive = Mount-UserHive -Sid $sid
-try {
-    Assert-True (Test-Path "$($hive.Root)\Software\Policies\Microsoft\Edge") 'Edge policies in the student hive'
-    Assert-True (Test-Path "$($hive.Root)\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer") 'Explorer restrictions in the student hive'
-    $runKey = Get-ItemProperty -Path "$($hive.Root)\Software\Microsoft\Windows\CurrentVersion\Run"
-    Assert-True ($runKey.ProctorKiosk -like '*--kiosk*') 'kiosk autorun present'
-}
-finally {
-    Dismount-UserHive -Hive $hive
-}
 
 $task = Get-ScheduledTask -TaskName "ExamSync-$userName" -ErrorAction SilentlyContinue
 Assert-True ($null -ne $task) 'sync task registered'
@@ -283,6 +286,8 @@ Assert-True (Test-Path 'C:\Kiosk\Exam.pdf') 'Exam.pdf survives an unreachable sh
 Install-ShareCredential -Credential $shareCredential -DataDir 'C:\ProgramData\proctor'
 
 Write-Information ''
+[gc]::Collect()
+[gc]::WaitForPendingFinalizers()
 Write-Information 'Running uninstall.ps1...'
 & powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -File (Join-Path -Path $root -ChildPath 'uninstall.ps1') -Force -UserName $userName
 Assert-True ($LASTEXITCODE -eq 0) 'uninstall.ps1 exits 0'
