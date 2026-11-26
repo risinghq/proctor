@@ -231,7 +231,7 @@ $serverTask = Get-ScheduledTask -TaskName "ExamServer-$userName" -ErrorAction Si
 Assert-True ($null -ne $serverTask) 'server task registered'
 Assert-True ($serverTask.Principal.UserId -match 'SYSTEM') 'server task runs as SYSTEM'
 Assert-True ($serverTask.Triggers[0].CimClass.CimClassName -eq 'MSFT_TaskBootTrigger') 'server task starts at boot'
-Assert-True ($null -ne (& netsh.exe http show urlacl | Select-String -SimpleMatch "$kioskBase/")) 'URL ACL reserved for the kiosk port'
+Assert-True ($null -ne (Get-UrlAclReservation -Prefix "$kioskBase/")) 'URL ACL reserved for the kiosk port'
 
 Write-Information ''
 Write-Information 'Checking install refuses a different port...'
@@ -252,7 +252,7 @@ $proctorSddl = Get-ProctorUrlAclSddl
 & powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -File (Join-Path -Path $root -ChildPath 'install.ps1') `
     -Config $configPath
 Assert-True ($LASTEXITCODE -ne 0) 'install fails on a foreign URL reservation'
-Assert-True ($null -ne (& netsh.exe http show urlacl | Select-String -SimpleMatch "$kioskBase/")) 'foreign reservation untouched by install'
+Assert-True ($null -ne (Get-UrlAclReservation -Prefix "$kioskBase/")) 'foreign reservation untouched by install'
 Assert-True ((Get-Content -Path 'C:\ProgramData\proctor\install.json' -Raw) -eq $installJsonBefore) 'failed install leaves install.json unchanged'
 Assert-True (((Get-ScheduledTask -TaskName "ExamServer-$userName").Actions[0].Arguments) -eq $serverTaskBefore) 'failed install leaves the server task unchanged'
 & netsh.exe http delete urlacl "url=$kioskBase/" | Out-Null
@@ -421,7 +421,7 @@ Write-Information 'Checking uninstall refuses a corrupt install record...'
 '{ bad json' | Set-Content -Path 'C:\ProgramData\proctor\install.json' -Encoding UTF8
 & powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -File (Join-Path -Path $root -ChildPath 'uninstall.ps1') -Force -UserName $userName
 Assert-True ($LASTEXITCODE -ne 0) 'uninstall fails on corrupt install metadata'
-Assert-True ($null -ne (& netsh.exe http show urlacl | Select-String -SimpleMatch "$kioskBase/")) 'URL ACL survives the failed uninstall'
+Assert-True ($null -ne (Get-UrlAclReservation -Prefix "$kioskBase/")) 'URL ACL survives the failed uninstall'
 
 $sddl = Get-ProctorUrlAclSddl
 '{ "port": ' + $kioskPort + ', "urlAclCreated": true, "urlAclSddl": "' + $sddl + '" }' |
@@ -429,6 +429,8 @@ $sddl = Get-ProctorUrlAclSddl
 
 Write-Information ''
 Write-Information (& netsh.exe http show urlacl "url=$kioskBase/" | Out-String)
+$registryReservation = Get-UrlAclReservation -Prefix "$kioskBase/"
+Write-Information "  registry reservation: $($registryReservation.Sddl)"
 [gc]::Collect()
 [gc]::WaitForPendingFinalizers()
 Write-Information 'Running uninstall.ps1...'
@@ -438,7 +440,7 @@ Assert-True ($LASTEXITCODE -eq 0) 'uninstall.ps1 exits 0'
 Write-Information 'Checking the laptop is back to a clean state...'
 Assert-True ($null -eq (Get-ScheduledTask -TaskName "ExamSync-$userName" -ErrorAction SilentlyContinue)) 'sync task removed'
 Assert-True ($null -eq (Get-ScheduledTask -TaskName "ExamServer-$userName" -ErrorAction SilentlyContinue)) 'server task removed'
-Assert-True ($null -eq (& netsh.exe http show urlacl | Select-String -SimpleMatch "$kioskBase/")) 'URL ACL removed'
+Assert-True ($null -eq (Get-UrlAclReservation -Prefix "$kioskBase/")) 'URL ACL removed'
 Assert-True ($null -eq (Get-NetFirewallRule -DisplayName "BlockInternet-$userName" -ErrorAction SilentlyContinue)) 'block rule removed'
 Assert-True ($null -eq (Get-LocalUser -Name $userName -ErrorAction SilentlyContinue)) 'student account removed'
 Assert-True ($null -eq (Get-CimInstance Win32_UserProfile -Filter "SID='$sid'" -ErrorAction SilentlyContinue)) 'profile removed'
@@ -457,9 +459,9 @@ New-Item -Path 'C:\ProgramData\proctor' -ItemType Directory -Force | Out-Null
 & netsh.exe http add urlacl "url=$kioskBase/" "sddl=D:(A;;GX;;;SY)(A;;GX;;;BA)" | Out-Null
 & powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -File (Join-Path -Path $root -ChildPath 'uninstall.ps1') -Force -UserName $userName
 Assert-True ($LASTEXITCODE -eq 0) 'uninstall exits 0 on a changed reservation ACL'
-Assert-True ($null -ne (& netsh.exe http show urlacl | Select-String -SimpleMatch "$kioskBase/")) 'reservation with a different ACL survives uninstall'
+Assert-True ($null -ne (Get-UrlAclReservation -Prefix "$kioskBase/")) 'reservation with a different ACL survives uninstall'
 & netsh.exe http delete urlacl "url=$kioskBase/" | Out-Null
-Assert-True ($null -eq (& netsh.exe http show urlacl | Select-String -SimpleMatch "$kioskBase/")) 'URL ACL removed'
+Assert-True ($null -eq (Get-UrlAclReservation -Prefix "$kioskBase/")) 'URL ACL removed'
 Assert-True (-not (Test-Path 'C:\ProgramData\proctor')) 'C:\ProgramData\proctor removed again'
 
 Remove-SmbShare -Name $shareName -Force

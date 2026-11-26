@@ -387,6 +387,30 @@ Describe 'Test-ExamVersionChanged' {
     }
 }
 
+Describe 'Get-UrlAclReservation' {
+    It 'returns null when the registry key is missing' {
+        Mock -ModuleName proctor Read-UrlAclRegistry { return @{} }
+        Get-UrlAclReservation -Prefix 'http://127.0.0.1:8471/' | Should -BeNullOrEmpty
+    }
+
+    It 'returns null when the URL is not reserved' {
+        Mock -ModuleName proctor Read-UrlAclRegistry { return @{ 'http://other.example/' = 'D:(A;;GX;;;SY)' } }
+        Get-UrlAclReservation -Prefix 'http://127.0.0.1:8471/' | Should -BeNullOrEmpty
+    }
+
+    It 'returns the stored reservation with its SDDL' {
+        Mock -ModuleName proctor Read-UrlAclRegistry { return @{ 'http://127.0.0.1:8471/' = 'D:(A;;GX;;;SY)' } }
+        $reservation = Get-UrlAclReservation -Prefix 'http://127.0.0.1:8471/'
+        $reservation.Prefix | Should -Be 'http://127.0.0.1:8471/'
+        $reservation.Sddl | Should -Be 'D:(A;;GX;;;SY)'
+    }
+
+    It 'matches the URL case-insensitively' {
+        Mock -ModuleName proctor Read-UrlAclRegistry { return @{ 'HTTP://127.0.0.1:8471/' = 'D:(A;;GX;;;SY)' } }
+        (Get-UrlAclReservation -Prefix 'http://127.0.0.1:8471/').Sddl | Should -Be 'D:(A;;GX;;;SY)'
+    }
+}
+
 Describe 'Get-UrlAclPlan' {
     It 'creates the reservation when none exists' {
         Get-UrlAclPlan -Exists $false -PriorInfo $null -Port 8471 | Should -Be 'Create'

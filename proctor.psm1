@@ -1080,24 +1080,52 @@ function Remove-ProctorTask {
     }
 }
 
+function Read-UrlAclRegistry {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param()
+
+    # HTTP.sys names each URL reservation value by the reserved URL. Its data
+    # is the SDDL as a string or a binary security descriptor, depending on
+    # the Windows build, so both are read as SDDL. Only a missing key means no
+    # reservations; any other read error throws.
+    $map = @{}
+    $path = 'HKLM:\SYSTEM\CurrentControlSet\Services\HTTP\Parameters\UrlAclInfo'
+    if (-not (Test-Path -LiteralPath $path -ErrorAction Stop)) {
+        return $map
+    }
+    $key = Get-Item -LiteralPath $path -ErrorAction Stop
+    foreach ($name in $key.GetValueNames()) {
+        $value = $key.GetValue($name)
+        if ($value -is [byte[]]) {
+            $value = (New-Object System.Security.AccessControl.RawSecurityDescriptor -ArgumentList $value, 0).GetSddlForm(
+                [System.Security.AccessControl.AccessControlSections]::All)
+        }
+        $map[$name] = [string]$value
+    }
+    return $map
+}
+
 function Get-UrlAclReservation {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Prefix)
 
-    # $null when no reservation exists; otherwise the prefix and the account
-    # it grants, for the caller's ownership decision and error messages.
-    # The url= lookup form can miss a stored reservation, so this parses the
-    # full listing and takes the block whose Reserved URL is the prefix.
-    $show = & netsh.exe http show urlacl 2>$null
-    $block = $show | Select-String -Pattern "Reserved URL\s*:\s*$([regex]::Escape($Prefix))\s*$" -Context 0, 8 |
-        Select-Object -First 1
-    if (-not $block) {
+    # $null when no reservation exists; otherwise the stored prefix and the
+    # SDDL, for the caller's ownership decision and error messages.
+    $reservations = Read-UrlAclRegistry
+    $name = $reservations.Keys | Where-Object { $_ -ieq $Prefix } | Select-Object -First 1
+    if (-not $name) {
         return $null
     }
-    $lines = @($block.Line) + @($block.Context.PostContext)
-    $user = ($lines | Select-String -Pattern 'User:\s*(\S.*)' | Select-Object -First 1).Matches.Groups[1].Value
-    $sddl = ($lines | Select-String -Pattern 'SDDL:\s*(\S.*)' | Select-Object -First 1).Matches.Groups[1].Value
-    return [pscustomobject]@{ Prefix = $Prefix; User = $user; Sddl = ([string]$sddl).Trim() }
+    $sddl = $reservations[$name]
+    # User is only for messages: translate each SID, keep the SID on failure.
+    $user = [regex]::Matches($sddl, 'S-\d+(-\d+)*') | ForEach-Object {
+        try {
+            ([System.Security.Principal.SecurityIdentifier]$_.Value).Translate([System.Security.Principal.NTAccount]).Value
+        }
+        catch { $_.Value }
+    } | Select-Object -Unique
+    return [pscustomobject]@{ Prefix = $name; User = ($user -join ', '); Sddl = $sddl }
 }
 
 function Get-ProctorUrlAclSddl {
