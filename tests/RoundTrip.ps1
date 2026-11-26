@@ -147,11 +147,15 @@ try {
 $probeTask = 'ProctorFirewallProbe'
 $probeAction = New-ScheduledTaskAction -Execute 'powershell.exe' `
     -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$probeScript`""
-$probePrincipal = New-ScheduledTaskPrincipal -UserId $userName -LogonType S4U -RunLevel Limited
+$probePasswordPlain = "P!$([guid]::NewGuid().ToString('N').Substring(0, 16))"
+$probePassword = New-Object System.Security.SecureString
+foreach ($c in $probePasswordPlain.ToCharArray()) { $probePassword.AppendChar($c) }
 
+Set-LocalUser -Name $userName -Password $probePassword
 Set-StudentBatchRight -AccountSid $sid
 try {
-    Register-ScheduledTask -TaskName $probeTask -Action $probeAction -Principal $probePrincipal | Out-Null
+    Register-ScheduledTask -TaskName $probeTask -Action $probeAction `
+        -User $userName -Password $probePasswordPlain -RunLevel Limited | Out-Null
     try {
         Start-ScheduledTask -TaskName $probeTask
         $deadline = (Get-Date).AddMinutes(2)
@@ -160,9 +164,16 @@ try {
             $probe = Get-ScheduledTask -TaskName $probeTask
         } while ($probe.State -eq 'Running' -and (Get-Date) -lt $deadline)
         if ($probe.State -eq 'Running') { throw 'Probe task still running after 2 minutes' }
+        $probeInfo = Get-ScheduledTaskInfo -TaskName $probeTask
+        Write-Information "  probe task LastTaskResult: $($probeInfo.LastTaskResult)"
     }
     finally {
         Unregister-ScheduledTask -TaskName $probeTask -Confirm:$false -ErrorAction SilentlyContinue
+        try {
+            Set-LocalUser -Name $userName -Password (New-Object System.Security.SecureString)
+        } catch {
+            Write-Warning "Could not restore the empty password: $($_.Exception.Message)"
+        }
     }
 }
 finally {
@@ -172,6 +183,7 @@ Assert-True (-not (Get-StudentBatchRight -AccountSid $sid)) 'SeBatchLogonRight r
 
 $probeOut = Get-Content -Path $probeResult -TotalCount 1 -ErrorAction SilentlyContinue
 Write-Information "  probe result: $probeOut"
+Assert-True ($probeInfo.LastTaskResult -eq 0) "probe task ran (result $($probeInfo.LastTaskResult))"
 Assert-True ($probeOut -eq 'blocked') 'student cannot open TCP 445 to the share host'
 
 Assert-True (Test-Path 'C:\Kiosk\index.html') 'index.html deployed'
