@@ -124,25 +124,43 @@ Assert-True ($winlogon.DefaultUserName -eq $userName) 'auto-logon targets the st
 Assert-True ($null -ne (Get-NetFirewallRule -DisplayName "BlockInternet-$userName" -ErrorAction SilentlyContinue)) 'outbound block rule exists'
 Assert-True ($null -eq (Get-NetFirewallRule -DisplayName "AllowSMB-$userName" -ErrorAction SilentlyContinue)) 'no SMB allow rule for the student'
 
-Write-Information 'Checking the student cannot reach the share host...'
+$blockFilter = Get-NetFirewallRule -DisplayName "BlockInternet-$userName" | Get-NetFirewallSecurityFilter
+Assert-True ($blockFilter.LocalUser -match [regex]::Escape($sid)) 'block rule applies to the student SID'
+
+# Windows Firewall never filters loopback, so the probe dials an outside host.
+# The admin control connection shows the host is reachable from this runner.
+$probeTarget = ([System.Net.Dns]::GetHostAddresses('github.com') |
+    Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1).IPAddressToString
+$control = New-Object System.Net.Sockets.TcpClient
+$controlConnected = $false
+try {
+    $controlConnect = $control.BeginConnect($probeTarget, 443, $null, $null)
+    $controlConnected = $controlConnect.AsyncWaitHandle.WaitOne(5000) -and $control.Connected
+}
+finally {
+    $control.Close()
+}
+Assert-True $controlConnected "admin reaches $($probeTarget):443"
+
+Write-Information "Checking the student cannot reach $($probeTarget):443..."
 $probeScript = 'C:\Users\Public\fw-probe.ps1'
 $probeResult = 'C:\Users\Public\fw-probe.txt'
 if (Test-Path $probeResult) { Remove-Item $probeResult -Force }
-@'
-$target = "127.0.0.1"
-$result = "C:\Users\Public\fw-probe.txt"
+@"
+`$target = '$probeTarget'
+`$result = "C:\Users\Public\fw-probe.txt"
 try {
-    $client = New-Object System.Net.Sockets.TcpClient
-    $connect = $client.BeginConnect($target, 445, $null, $null)
-    if ($connect.AsyncWaitHandle.WaitOne(5000) -and $client.Connected) {
-        "connected" | Set-Content -Path $result
+    `$client = New-Object System.Net.Sockets.TcpClient
+    `$connect = `$client.BeginConnect(`$target, 443, `$null, `$null)
+    if (`$connect.AsyncWaitHandle.WaitOne(5000) -and `$client.Connected) {
+        "connected" | Set-Content -Path `$result
     } else {
-        "blocked" | Set-Content -Path $result
+        "blocked" | Set-Content -Path `$result
     }
 } catch {
-    "blocked" | Set-Content -Path $result
+    "blocked" | Set-Content -Path `$result
 }
-'@ | Set-Content -Path $probeScript -Encoding UTF8
+"@ | Set-Content -Path $probeScript -Encoding UTF8
 
 $probeTask = 'ProctorFirewallProbe'
 $probeAction = New-ScheduledTaskAction -Execute 'powershell.exe' `
@@ -184,7 +202,7 @@ Assert-True (-not (Get-StudentBatchRight -AccountSid $sid)) 'SeBatchLogonRight r
 $probeOut = Get-Content -Path $probeResult -TotalCount 1 -ErrorAction SilentlyContinue
 Write-Information "  probe result: $probeOut"
 Assert-True ($probeInfo.LastTaskResult -eq 0) "probe task ran (result $($probeInfo.LastTaskResult))"
-Assert-True ($probeOut -eq 'blocked') 'student cannot open TCP 445 to the share host'
+Assert-True ($probeOut -eq 'blocked') 'student cannot open an outbound connection'
 
 Assert-True (Test-Path 'C:\Kiosk\index.html') 'index.html deployed'
 Assert-True (Test-Path 'C:\Kiosk\sync-exam.ps1') 'sync-exam.ps1 deployed'

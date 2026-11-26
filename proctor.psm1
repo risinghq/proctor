@@ -555,8 +555,7 @@ function Set-FirewallLockdown {
     New-NetFirewallRule -DisplayName $BlockRuleName `
         -Direction Outbound `
         -Action Block `
-        -Owner $Sid `
-        -Program Any | Out-Null
+        -LocalUser "D:(A;;CC;;;$Sid)" | Out-Null
 }
 
 function Remove-FirewallLockdown {
