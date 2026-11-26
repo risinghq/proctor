@@ -316,12 +316,19 @@ public static extern int CreateProfile(
 '@
             Add-Type -MemberDefinition $signature -Name UserEnv -Namespace Proctor.Native
         }
-        $buffer = New-Object System.Text.StringBuilder -ArgumentList 512
-        $hresult = [Proctor.Native.UserEnv]::CreateProfile($Sid, $UserName, $buffer, [uint32]$buffer.Capacity)
-        if ($hresult -ne 0) {
-            [System.Runtime.InteropServices.Marshal]::ThrowExceptionForHR($hresult)
+        # MAX_PATH: cchProfilePath above 260 makes the RPC stub fail the call.
+        $buffer = New-Object System.Text.StringBuilder -ArgumentList 260
+        $hresult = [Proctor.Native.UserEnv]::CreateProfile($Sid, $UserName, $buffer, 260)
+        if ($hresult -eq 0) {
+            return $buffer.ToString()
         }
-        return $buffer.ToString()
+        if ($hresult -eq 0x800700B7) {
+            $created = Get-CimInstance Win32_UserProfile -Filter "SID='$Sid'" -ErrorAction SilentlyContinue
+            if ($created) {
+                return $created.LocalPath
+            }
+        }
+        [System.Runtime.InteropServices.Marshal]::ThrowExceptionForHR($hresult)
     }
 }
 
