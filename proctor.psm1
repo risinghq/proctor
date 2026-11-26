@@ -815,6 +815,15 @@ function Stop-UserSession {
             }
         }
     }
+
+    # Batch and service logons do not appear in quser but still hold the hive.
+    $owned = Get-Process -IncludeUserName -ErrorAction SilentlyContinue |
+        Where-Object { $_.UserName -and ($_.UserName -split '\\')[-1] -eq $UserName }
+    foreach ($process in $owned) {
+        if ($PSCmdlet.ShouldProcess("$($process.Name) ($($process.Id))", 'stop student process')) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 function Remove-UserProfile {
@@ -841,6 +850,8 @@ function Remove-UserProfile {
                 $loaded = @("Registry::HKEY_USERS\$Sid", "Registry::HKEY_LOCAL_MACHINE\ProctorHive_$Sid") | Where-Object { Test-Path $_ }
                 throw "Profile $Sid is still loaded after $TimeoutSeconds s (hives loaded: $($loaded -join ', ')): $($_.Exception.Message)"
             }
+            & reg.exe unload "HKU\$Sid" 2>$null | Out-Null
+            & reg.exe unload "HKU\$($Sid)_Classes" 2>$null | Out-Null
             Start-Sleep -Seconds 3
         }
     }
