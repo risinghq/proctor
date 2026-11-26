@@ -44,14 +44,20 @@ $configPath = Join-Path -Path $env:TEMP -ChildPath 'proctor-ci.json'
     deviceNumber = '01'
     examTitle    = 'CI exam'
     language     = 'en'
+    shareUser    = $shareUser
 } | ConvertTo-Json | Set-Content -Path $configPath -Encoding UTF8
 
 $shareCredential = New-Object System.Management.Automation.PSCredential -ArgumentList $shareUser, $securePassword
+# A PSCredential cannot cross a powershell.exe -File boundary; the string
+# form is bound as a username and the binder prompts for a password, which
+# hangs CI. Seed share.cred through the same function install uses, and
+# pass shareUser in the config instead.
+Install-ShareCredential -Credential $shareCredential -DataDir 'C:\ProgramData\proctor'
 
 Write-Information ''
 Write-Information 'Running install.ps1...'
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path -Path $root -ChildPath 'install.ps1') `
-    -Config $configPath -ShareCredential $shareCredential
+& powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -File (Join-Path -Path $root -ChildPath 'install.ps1') `
+    -Config $configPath
 Assert-True ($LASTEXITCODE -eq 0) 'install.ps1 exits 0'
 
 $editionId = Get-WindowsEditionId
@@ -106,6 +112,7 @@ do {
     Start-Sleep -Seconds 2
     $probe = Get-ScheduledTask -TaskName $probeTask
 } while ($probe.State -eq 'Running' -and (Get-Date) -lt $deadline)
+if ($probe.State -eq 'Running') { throw 'Probe task still running after 2 minutes' }
 Unregister-ScheduledTask -TaskName $probeTask -Confirm:$false
 $probeOut = Get-Content -Path $probeResult -TotalCount 1 -ErrorAction SilentlyContinue
 Write-Information "  probe result: $probeOut"
@@ -148,6 +155,7 @@ do {
     Start-Sleep -Seconds 2
     $task = Get-ScheduledTask -TaskName "ExamSync-$userName"
 } while ($task.State -eq 'Running' -and (Get-Date) -lt $deadline)
+if ($task.State -eq 'Running') { throw "ExamSync-$userName still running after 2 minutes" }
 
 $info = Get-ScheduledTaskInfo -TaskName "ExamSync-$userName"
 Write-Information "  LastTaskResult: $($info.LastTaskResult)"
@@ -180,6 +188,7 @@ do {
     Start-Sleep -Seconds 2
     $task = Get-ScheduledTask -TaskName "ExamSync-$userName"
 } while ($task.State -eq 'Running' -and (Get-Date) -lt $deadline)
+if ($task.State -eq 'Running') { throw "ExamSync-$userName still running after 2 minutes" }
 $info = Get-ScheduledTaskInfo -TaskName "ExamSync-$userName"
 Write-Information "  LastTaskResult: $($info.LastTaskResult)"
 Assert-True ($info.LastTaskResult -ne 0) 'sync task fails with a bad credential'
@@ -189,7 +198,7 @@ Install-ShareCredential -Credential $shareCredential -DataDir 'C:\ProgramData\pr
 
 Write-Information ''
 Write-Information 'Running uninstall.ps1...'
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path -Path $root -ChildPath 'uninstall.ps1') -Force -UserName $userName
+& powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -File (Join-Path -Path $root -ChildPath 'uninstall.ps1') -Force -UserName $userName
 Assert-True ($LASTEXITCODE -eq 0) 'uninstall.ps1 exits 0'
 
 Write-Information 'Checking the laptop is back to a clean state...'
