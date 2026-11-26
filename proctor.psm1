@@ -646,7 +646,7 @@ function Invoke-SystemTask {
     }
 
     if (-not (Test-Path $ResultPath)) {
-        throw "System task '$TaskName' produced no result"
+        throw "System task '$TaskName' produced no result at $ResultPath (last state: $state)"
     }
     $result = (Get-Content -Path $ResultPath -Raw).Trim()
     if ($result -ne 'ok') {

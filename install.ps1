@@ -31,8 +31,17 @@ foreach ($name in 'Server', 'Share', 'UserPrefix', 'DeviceNumber', 'ExamTitle', 
 $proctor = Resolve-ProctorConfig -Parameters $parameters -File $fileValues
 
 $credential = $ShareCredential
-if ($null -eq $credential -and $proctor.ShareUser) {
-    $password = Read-Host "Password for share account $($proctor.ShareUser)" -AsSecureString
+$credPath = Join-Path $proctor.DataDir 'share.cred'
+if ($null -eq $credential -and $proctor.ShareUser -and -not (Test-Path $credPath)) {
+    try {
+        $password = Read-Host "Password for share account $($proctor.ShareUser)" -AsSecureString
+    }
+    catch {
+        throw "Cannot prompt for the share password in a non-interactive session; pass -ShareCredential or pre-seed $credPath"
+    }
+    if ($password.Length -eq 0) {
+        throw "Empty password for share account $($proctor.ShareUser)"
+    }
     $credential = New-Object System.Management.Automation.PSCredential -ArgumentList $proctor.ShareUser, $password
 }
 
@@ -62,6 +71,9 @@ Set-KioskAcl -Path $proctor.KioskDir -UserName $proctor.UserName
 if ($credential) {
     Write-Information 'Storing share credential...'
     Install-ShareCredential -Credential $credential -DataDir $proctor.DataDir
+}
+elseif ($proctor.ShareUser) {
+    Write-Information 'Share credential already stored'
 }
 
 Write-Information 'Setting auto-logon...'
