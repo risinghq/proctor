@@ -1,49 +1,52 @@
 # proctor
 
-proctor prepara un portátil con Windows para un examen. Crea una cuenta de
-alumno sin contraseña, limita lo que esa cuenta puede hacer y muestra el
-examen en pantalla: una página a pantalla completa en Microsoft Edge que
-muestra el PDF que llega por la red. Las respuestas se escriben en papel;
-proctor no recoge ni corrige nada.
+proctor prepares a Windows laptop for an exam. It creates a passwordless
+student account, limits what that account can do, and shows the exam on
+screen: a full-screen page in Microsoft Edge that displays the PDF arriving
+over the network. A small HTTP server on the laptop decides what the page
+shows — a waiting screen before the exam opens, the PDF with a countdown
+while it is open, and a "time is up" screen after it closes. Answers are
+written on paper; proctor collects and grades nothing.
 
-## Requisitos
+## Requirements
 
-- Windows 10 u 11, o Windows Server. PowerShell 5.1, incluido en Windows.
-- Microsoft Edge instalado.
-- Una carpeta compartida por SMB en la red local.
-- Ejecutar la instalación como administrador.
+- Windows 10 or 11, or Windows Server. PowerShell 5.1, included in Windows.
+- Microsoft Edge installed.
+- An SMB share on the local network.
+- Run the install as administrator.
 
-## Instalación
+## Installation
 
-Ejecutar como administrador en cada portátil:
+Run as administrator on each laptop:
 
 ```powershell
 .\install.ps1 -Config .\config.json
 ```
 
-o con parámetros directamente:
+or with parameters directly:
 
 ```powershell
-.\install.ps1 -Server 192.168.5.30 -Share "sidera\Examenes" -DeviceNumber 01 -ExamTitle "Examen de matematicas" -ShareUser proctor-lectura
+.\install.ps1 -Server 192.168.5.30 -Share "sidera\Examenes" -DeviceNumber 01 -ExamTitle "Math midterm" -ShareUser proctor-lectura
 ```
 
-Con `-ShareUser` el instalador pide la contraseña en pantalla (no aparece en
-ningún archivo ni en el comando). En scripts se pasa
-`-ShareCredential (Get-Credential)`; en ese caso `-ShareUser` no hace falta.
+With `-ShareUser` the installer asks for the password on screen (it appears
+in no file and no command). In scripts pass
+`-ShareCredential (Get-Credential)`; then `-ShareUser` is not needed.
 
-| Parámetro | Descripción | Valor por defecto |
+| Parameter | Description | Default |
 | --- | --- | --- |
-| `-Server` | Nombre o IP del servidor con la carpeta compartida. | (obligatorio) |
-| `-Share` | Ruta compartida bajo el servidor. También acepta la ruta UNC completa, por ejemplo `\\192.168.5.30\sidera\Examenes`. | (obligatorio) |
-| `-UserPrefix` | Prefijo de la cuenta de alumno. La cuenta final es `<prefijo>-<NN>`. | `Alumno` |
-| `-DeviceNumber` | Número del equipo, dos dígitos. | (obligatorio) |
-| `-ExamTitle` | Título que se muestra en pantalla. | (obligatorio) |
-| `-Language` | Idioma de la página: `es` o `en`. | `es` |
-| `-ShareUser` | Cuenta del servidor con permiso de lectura sobre la carpeta compartida. La contraseña se pide en pantalla. | (sin credencial) |
-| `-ShareCredential` | Credencial ya construida, para ejecuciones con script. | |
-| `-Config` | Archivo JSON con los mismos valores (incluye `shareUser`). La contraseña nunca va en el archivo. Los parámetros tienen prioridad. | |
+| `-Server` | Name or IP of the server holding the share. | (required) |
+| `-Share` | Share path under the server. Also accepts the full UNC path, for example `\\192.168.5.30\sidera\Examenes`. | (required) |
+| `-UserPrefix` | Prefix for the student account. The final account is `<prefix>-<NN>`. | `Alumno` |
+| `-DeviceNumber` | Device number, two digits. | (required) |
+| `-ExamTitle` | Title shown on screen. | (required) |
+| `-Language` | Page language: `es` or `en`. | `es` |
+| `-ShareUser` | Server account with read access to the share. The password is asked on screen. | (no credential) |
+| `-ShareCredential` | A ready-made credential, for scripted runs. | |
+| `-Port` | Loopback port for the kiosk server. | `8471` |
+| `-Config` | JSON file with the same values (includes `shareUser`). The password never goes in the file. Parameters win. | |
 
-Ejemplo de `config.json` (ver `config.example.json`):
+Example `config.json` (see `config.example.json`):
 
 ```json
 {
@@ -51,71 +54,115 @@ Ejemplo de `config.json` (ver `config.example.json`):
   "share": "sidera/Examenes",
   "userPrefix": "Alumno",
   "deviceNumber": "01",
-  "examTitle": "Examen de matematicas",
+  "examTitle": "Math midterm",
   "language": "es"
 }
 ```
 
-La instalación crea la cuenta de alumno sin contraseña, genera su perfil sin
-que nadie inicie sesión y deja el inicio de sesión automático apuntando a esa
-cuenta. Ejecutarla dos veces produce el mismo resultado.
+The install creates the passwordless student account, builds its profile
+without anyone signing in, and points auto-logon at that account. Running it
+twice produces the same result.
 
-## Cómo llega el examen
+## How the exam arrives
 
-La tarea de sincronización copia cada minuto el PDF más reciente de
-`\\<servidor>\<share>\Dispositivo NN` (o `Device NN` en inglés) a
-`C:\Kiosk\Exam.pdf`. Para publicar un examen basta con dejar el PDF en la
-carpeta del equipo; para retirarlo, borrar el archivo de esa carpeta.
+The sync task copies the newest PDF every minute from
+`\\<server>\<share>\Dispositivo NN` (or `Device NN` in English) into a
+versioned folder under `C:\ProgramData\proctor\exam`, then repoints
+`current.txt` at it. `C:\ProgramData\proctor` allows only SYSTEM and
+Administrators, so the student cannot open the PDF directly. To publish an
+exam, drop the PDF in the device folder; to withdraw it, delete the file
+there.
 
-La tarea se ejecuta como SYSTEM y se conecta a la carpeta con una cuenta
-propia. El servidor necesita una cuenta de solo lectura sobre la carpeta
-compartida (por ejemplo `proctor-lectura`), que se indica con `-ShareUser` o
-`shareUser` en la configuración. La contraseña se guarda cifrada con DPAPI en
-`C:\ProgramData\proctor\share.cred`, accesible solo para SYSTEM y
-Administradores. Sin credencial almacenada la conexión es anónima.
+The task runs as SYSTEM and connects to the share with its own account. The
+server needs a read-only account on the share (for example
+`proctor-lectura`), given with `-ShareUser` or `shareUser` in the config.
+The password is stored DPAPI-encrypted in
+`C:\ProgramData\proctor\share.cred`, readable only by SYSTEM and
+Administrators. Without a stored credential the connection is anonymous.
 
-Una carpeta abierta a invitados no sirve: Windows 11 24H2 rechaza por defecto
-las conexiones SMB de invitado y anónimas, por lo que el servidor no debe
-depender de una carpeta sin autenticación.
+A share open to guests does not work: Windows 11 24H2 refuses guest and
+anonymous SMB connections by default, so the server must not rely on an
+unauthenticated share.
 
-## Bloqueo
+## The exam window
 
-La cuenta de alumno no tiene acceso a internet: el firewall bloquea todo el
-tráfico saliente de esa cuenta. La tarea de sincronización se ejecuta como
-SYSTEM, así que la cuenta de alumno no necesita llegar a la carpeta
-compartida y tampoco puede leer los exámenes de otros equipos. Edge aplica políticas que deshabilitan descargas, impresión,
-el menú contextual y el inicio de sesión.
+An optional `exam.json` next to the PDF in the device folder schedules the
+exam. The sync task mirrors it into the same version folder as the PDF, so
+the server always reads a consistent pair.
 
-En Windows Pro, Education y Enterprise la cuenta funciona como quiosco de
-aplicación única mediante Assigned Access: Edge abre
-`file:///C:/Kiosk/index.html` a pantalla completa.
+```json
+{
+  "title": "Math midterm",
+  "opensAt": "2026-03-10T09:00:00+01:00",
+  "closesAt": "2026-03-10T11:00:00+01:00"
+}
+```
 
-En Windows Home, que no tiene Assigned Access, se aplican restricciones del
-registro (sin Ejecutar, sin símbolo del sistema, sin Administrador de tareas)
-y Edge arranca en modo quiosco al iniciar sesión.
+`opensAt` and `closesAt` are ISO-8601 timestamps with an offset. The laptop
+clock decides the phase; the student account cannot change the clock.
 
-El instalador imprime la edición que encontró y la vía que aplicó.
+- Before `opensAt` the page shows a waiting screen with a countdown.
+- Between `opensAt` and `closesAt` it shows the PDF and the time left.
+- After `closesAt` it shows a "time is up" screen and hides the PDF.
+- With no `exam.json` the exam is unscheduled: the PDF shows whenever it is
+  present, with no countdown.
+- A malformed `exam.json` (unparseable, a bad or offset-less timestamp, or a
+  `closesAt` at or before `opensAt`) blocks the exam: the page shows a
+  schedule-error screen telling students to notify the proctor, the PDF is
+  not served, and an error lands in `C:\Kiosk\Logs\server_*.log`.
 
-## Desinstalación
+## The kiosk server
+
+A PowerShell `HttpListener` bound to `http://127.0.0.1:<port>/` serves the
+kiosk page. It runs as SYSTEM from its own scheduled task, started at boot
+and restarted on failure. The page polls `/state` every few seconds and
+renders the phase the server computes. `/exam.pdf` answers only while the
+exam is open or unscheduled, so the PDF is never reachable before `opensAt`
+or after `closesAt`.
+
+## Lockdown
+
+The student account has no internet access: the firewall blocks all outbound
+traffic for that account. Loopback is never filtered, so the page still
+reaches the kiosk server. The sync task runs as SYSTEM, so the student
+account neither needs to reach the share nor can read other devices' exam
+folders. Edge policies disable downloads, printing, the context menu and
+sign-in, and block `file://` pages.
+
+On Windows Pro, Education and Enterprise the account works as a single-app
+kiosk through Assigned Access: Edge opens `http://127.0.0.1:<port>/` full
+screen.
+
+On Windows Home, which has no Assigned Access, registry restrictions apply
+(no Run dialog, no command prompt, no Task Manager) and Edge starts in kiosk
+mode at logon.
+
+The installer prints the edition it found and the path it applied.
+
+## Uninstall
 
 ```powershell
 .\uninstall.ps1 -UserName Alumno-01 -Force
 ```
 
-o con los mismos parámetros de la instalación (`-Config`, `-UserPrefix`,
-`-DeviceNumber`). Quita la tarea, las reglas de firewall, las políticas,
-Assigned Access, el inicio automático de sesión, `C:\Kiosk`,
-`C:\ProgramData\proctor` (incluida la credencial), la cuenta de alumno y su
-perfil. Sin `-Force` pide confirmación. Funciona también después de una
-instalación incompleta.
+or with the same parameters as the install (`-Config`, `-UserPrefix`,
+`-DeviceNumber`). The install records its port and whether it created the
+URL reservation in `C:\ProgramData\proctor\install.json`, so uninstall
+removes only a reservation Proctor made, even when it runs with only
+`-UserName`. It removes both scheduled
+tasks, the URL reservation, the
+firewall rules, the policies, Assigned Access, auto-logon, `C:\Kiosk`,
+`C:\ProgramData\proctor` (including the credential), the student account and
+its profile. Without `-Force` it asks for confirmation. It also works after
+an incomplete install.
 
-## Desarrollo
+## Development
 
-Las comprobaciones se ejecutan con mise:
+Checks run with mise:
 
 ```
 mise run check
 ```
 
-`check` lanza `lint` (PSScriptAnalyzer) y `test` (Pester). Necesitan `pwsh`
-en el PATH; las tareas instalan los módulos que falten en el usuario actual.
+`check` runs `lint` (PSScriptAnalyzer) and `test` (Pester). They need `pwsh`
+on the PATH; the tasks install missing modules for the current user.
