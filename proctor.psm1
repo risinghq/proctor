@@ -394,9 +394,18 @@ function Dismount-UserHive {
         return
     }
     if ($PSCmdlet.ShouldProcess($Hive.HiveName, 'unload registry hive')) {
-        [gc]::Collect()
-        [gc]::WaitForPendingFinalizers()
-        & reg.exe unload "HKLM\$($Hive.HiveName)" | Out-Null
+        # PowerShell's registry provider keeps key handles open until they are
+        # collected, and reg unload fails while any handle remains.
+        foreach ($attempt in 1..5) {
+            [gc]::Collect()
+            [gc]::WaitForPendingFinalizers()
+            & reg.exe unload "HKLM\$($Hive.HiveName)" 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                return
+            }
+            Start-Sleep -Seconds 1
+        }
+        throw "reg unload failed for HKLM\$($Hive.HiveName)"
     }
 }
 
@@ -829,7 +838,8 @@ function Remove-UserProfile {
         }
         catch {
             if ((Get-Date) -ge $deadline) {
-                throw "Profile $Sid is still loaded after $TimeoutSeconds s: $($_.Exception.Message)"
+                $loaded = @("Registry::HKEY_USERS\$Sid", "Registry::HKEY_LOCAL_MACHINE\ProctorHive_$Sid") | Where-Object { Test-Path $_ }
+                throw "Profile $Sid is still loaded after $TimeoutSeconds s (hives loaded: $($loaded -join ', ')): $($_.Exception.Message)"
             }
             Start-Sleep -Seconds 3
         }
