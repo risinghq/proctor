@@ -51,6 +51,7 @@ function Resolve-ProctorConfig {
     $examTitle = Get-ConfigValue -Parameters $Parameters -File $File -Name 'ExamTitle' -Default $null
     $language = Get-ConfigValue -Parameters $Parameters -File $File -Name 'Language' -Default 'es'
     $shareUser = Get-ConfigValue -Parameters $Parameters -File $File -Name 'ShareUser' -Default $null
+    $port = Get-ConfigValue -Parameters $Parameters -File $File -Name 'Port' -Default '8471'
 
     # Share accepts either a path under the server ("sidera\Examenes") or a
     # full UNC ("\\server\sidera\Examenes"); in the UNC form the server inside
@@ -85,6 +86,10 @@ function Resolve-ProctorConfig {
     if ($userPrefix -notmatch '^[A-Za-z][A-Za-z0-9_-]*$') {
         throw "UserPrefix must start with a letter and contain only letters, digits, '-' or '_': '$userPrefix'"
     }
+    if ($port -notmatch '^\d+$' -or [int]$port -lt 1 -or [int]$port -gt 65535) {
+        throw "Port must be a number between 1 and 65535, got '$port'"
+    }
+    $port = [int]$port
 
     $share = $share -replace '/', '\'
     $share = $share.Trim('\')
@@ -97,21 +102,23 @@ function Resolve-ProctorConfig {
     $deviceFolder = '{0} {1}' -f (@{ es = 'Dispositivo'; en = 'Device' })[$language], $deviceNumber
 
     [pscustomobject]@{
-        Server        = $server
-        Share         = $share
-        UserPrefix    = $userPrefix
-        DeviceNumber  = $deviceNumber
-        ExamTitle     = $examTitle
-        Language      = $language
-        UserName      = $userName
-        DeviceFolder  = $deviceFolder
-        NetworkPath   = "\\$server\$share\$deviceFolder"
-        ShareUser     = $shareUser
-        KioskDir      = 'C:\Kiosk'
-        DataDir       = 'C:\ProgramData\proctor'
-        KioskUrl      = 'file:///C:/Kiosk/index.html'
-        TaskName      = "ExamSync-$userName"
-        BlockRuleName = "BlockInternet-$userName"
+        Server         = $server
+        Share          = $share
+        UserPrefix     = $userPrefix
+        DeviceNumber   = $deviceNumber
+        ExamTitle      = $examTitle
+        Language       = $language
+        UserName       = $userName
+        DeviceFolder   = $deviceFolder
+        NetworkPath    = "\\$server\$share\$deviceFolder"
+        ShareUser      = $shareUser
+        Port           = $port
+        KioskDir       = 'C:\Kiosk'
+        DataDir        = 'C:\ProgramData\proctor'
+        KioskUrl       = "http://127.0.0.1:$port/"
+        TaskName       = "ExamSync-$userName"
+        ServerTaskName = "ExamServer-$userName"
+        BlockRuleName  = "BlockInternet-$userName"
     }
 }
 
@@ -151,6 +158,178 @@ function Expand-ProctorTemplate {
         throw "Template token '$($Matches[0])' has no value"
     }
     return $result
+}
+
+function Get-ExamState {
+    [CmdletBinding()]
+    param(
+        # [object] keeps $null distinct from '': a missing file is phase
+        # 'none', an existing empty or whitespace file is 'error'. A [string]
+        # parameter coerces $null to '' and blurs the two.
+        [AllowNull()]
+        [AllowEmptyString()]
+        [object]$Json,
+        [Parameter(Mandatory)]
+        [datetimeoffset]$Now
+    )
+
+    # Phase 'none' is the unscheduled mode: no exam.json at all. A file that
+    # exists but cannot be parsed or validated is phase 'error': the caller
+    # logs it once per bad version and the exam never opens on a bad schedule.
+    $state = [pscustomobject]@{
+        Phase            = 'none'
+        Title            = $null
+        SecondsUntilOpen = $null
+        SecondsLeft      = $null
+        Malformed        = $false
+    }
+
+    if ($null -eq $Json) {
+        return $state
+    }
+    if ([string]::IsNullOrWhiteSpace($Json)) {
+        $state.Phase = 'error'
+        $state.Malformed = $true
+        return $state
+    }
+
+    try {
+        $spec = $Json | ConvertFrom-Json -ErrorAction Stop
+        if ($null -eq $spec -or $spec -isnot [pscustomobject]) {
+            throw 'exam.json must be a JSON object'
+        }
+        # The contract is strict ISO-8601 with an explicit Z or +-HH:MM
+        # offset at the top level. PS5.1 leaves the values as strings, so
+        # a suffix regex plus TryParseExact rejects culture shapes.
+        # PS7 converts ISO strings to DateTime: Utc means Z, Local means
+        # +-HH:MM, and Unspecified means the source carried no offset.
+        $isoFormats = 'yyyy-MM-ddTHH:mm:ssK', 'yyyy-MM-ddTHH:mm:ss.FFFFFFFK'
+        $parsed = @{}
+        foreach ($name in 'opensAt', 'closesAt') {
+            $prop = $spec.PSObject.Properties[$name]
+            if ($null -eq $prop) {
+                throw "$name must be an ISO-8601 timestamp with an explicit offset"
+            }
+            $value = $prop.Value
+            if ($value -is [datetime]) {
+                if ($value.Kind -eq [datetimekind]::Unspecified) {
+                    throw "$name must be an ISO-8601 timestamp with an explicit offset"
+                }
+                $parsed[$name] = [datetimeoffset]$value
+            } else {
+                $text = [string]$value
+                $instant = [datetimeoffset]::MinValue
+                if ($text -notmatch '(Z|[+-]\d{2}:\d{2})$' -or
+                    -not [datetimeoffset]::TryParseExact($text, [string[]]$isoFormats,
+                        [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None,
+                        [ref]$instant)) {
+                    throw "$name must be an ISO-8601 timestamp with an explicit offset"
+                }
+                $parsed[$name] = $instant
+            }
+        }
+        $opensAt = $parsed.opensAt
+        $closesAt = $parsed.closesAt
+        if ($closesAt -le $opensAt) {
+            throw 'closesAt must be after opensAt'
+        }
+    }
+    catch {
+        $state.Phase = 'error'
+        $state.Malformed = $true
+        return $state
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$spec.title)) {
+        $state.Title = [string]$spec.title
+    }
+
+    if ($Now -lt $opensAt) {
+        $state.Phase = 'waiting'
+        $state.SecondsUntilOpen = [int][math]::Ceiling(($opensAt - $Now).TotalSeconds)
+    }
+    elseif ($Now -lt $closesAt) {
+        $state.Phase = 'open'
+        $state.SecondsLeft = [int][math]::Ceiling(($closesAt - $Now).TotalSeconds)
+    }
+    else {
+        $state.Phase = 'closed'
+    }
+    return $state
+}
+
+function Test-ExamPdfServable {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Phase
+    )
+
+    # The PDF is served in 'open' and in 'none' (unscheduled exams keep the
+    # show-it-whenever-present behavior). It is never served while waiting,
+    # closed, or on a broken schedule.
+    return $Phase -eq 'open' -or $Phase -eq 'none'
+}
+
+function Resolve-ExamVersion {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory)][string]$DataDir)
+
+    # current.txt names the version folder the sync last published; a request
+    # reads exam.json and Exam.pdf only from the folder it resolves to.
+    $pointer = Join-Path $DataDir 'exam\current.txt'
+    if (-not (Test-Path $pointer)) {
+        return $null
+    }
+    $name = (Get-Content -Path $pointer -Raw).Trim()
+    $dir = Join-Path (Join-Path $DataDir 'exam') $name
+    if ([string]::IsNullOrWhiteSpace($name) -or -not (Test-Path $dir -PathType Container)) {
+        return $null
+    }
+    return $dir
+}
+
+function Get-ExamVersionsToPrune {
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [string[]]$Names,
+        [Parameter(Mandatory)][string]$Current
+    )
+
+    # Keeps the current version and the one before it; version names are
+    # timestamps, so a sort is a chronological order.
+    $sorted = @($Names | Sort-Object)
+    $keep = @($sorted | Where-Object { $_ -le $Current } | Sort-Object -Descending | Select-Object -First 2)
+    return @($sorted | Where-Object { $_ -notin $keep })
+}
+
+function Test-ExamVersionChanged {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [string]$CurrentDir,
+        $NetworkPdf,
+        $NetworkExamJson
+    )
+
+    # A file absent from a reachable share must be absent locally, so a
+    # presence change also counts as a change.
+    foreach ($pair in @(@($NetworkPdf, 'Exam.pdf'), @($NetworkExamJson, 'exam.json'))) {
+        $networkFile = $pair[0]
+        $localPath = if ($CurrentDir) { Join-Path $CurrentDir $pair[1] } else { $null }
+        if ($null -eq $networkFile) {
+            if ($localPath -and (Test-Path $localPath)) { return $true }
+        } else {
+            if (-not ($localPath -and (Test-Path $localPath))) { return $true }
+            $localHash = (Get-FileHash $localPath -Algorithm SHA256).Hash
+            $networkHash = (Get-FileHash $networkFile.FullName -Algorithm SHA256).Hash
+            if ($localHash -ne $networkHash) { return $true }
+        }
+    }
+    return $false
 }
 
 function Get-LockdownMode {
@@ -438,7 +617,8 @@ function Set-EdgePolicy {
         'ClearBrowsingDataOnExit'      = 1
         'DefaultCookiesSetting'        = 4
         'SitePerProcess'               = 0
-        'AllowFileAccessFromFiles'     = 1
+        # The page comes from the kiosk server; nothing should load file://.
+        'AllowFileAccessFromFiles'     = 0
         'RestoreOnStartup'             = 4
     }
     foreach ($policy in $policies.GetEnumerator()) {
@@ -615,11 +795,83 @@ function Install-ShareCredential {
     Set-Content -Path (Join-Path $DataDir 'share.cred') -Value $content -Encoding ASCII
 }
 
+function Save-ProctorInstallInfo {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]$Config,
+        [bool]$UrlAclCreated = $false,
+        $UrlAclSddl = $false
+    )
+
+    # The port lives here so uninstall removes the URL ACL install added,
+    # even when uninstall is called with only -UserName. urlAclCreated
+    # records whether the reservation is Proctor's to delete.
+    $path = Join-Path $Config.DataDir 'install.json'
+    if ($PSCmdlet.ShouldProcess($path, 'write install metadata')) {
+        New-Item -Path $Config.DataDir -ItemType Directory -Force | Out-Null
+        Set-ProctorDataAcl -Path $Config.DataDir
+        @{ port = $Config.Port; urlAclCreated = $UrlAclCreated; urlAclSddl = $UrlAclSddl } | ConvertTo-Json |
+            Set-Content -Path $path -Encoding UTF8
+    }
+}
+
+function Read-ProctorInstallInfo {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$DataDir)
+
+    # Missing metadata means an install predates it and the caller falls back
+    # to the configured port. An existing but unreadable file must fail loud:
+    # guessing the port can leave the real URL ACL behind.
+    # Absence must be confirmed, not inferred from an error: an access error
+    # on the file or its folder is a failure, never "no metadata".
+    $path = Join-Path $DataDir 'install.json'
+    if (-not (Test-Path -LiteralPath $path -ErrorAction Stop)) {
+        return $null
+    }
+    try {
+        $info = Get-Content -LiteralPath $path -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        throw "Cannot read install metadata at $path : $($_.Exception.Message). Pass -Port explicitly or fix the file."
+    }
+    $port = 0
+    if ($null -eq $info -or $null -eq $info.port -or
+        -not [int]::TryParse([string]$info.port, [ref]$port) -or
+        $port -lt 1 -or $port -gt 65535) {
+        throw "Install metadata at $path has an invalid port '$($info.port)'. Pass -Port explicitly or fix the file."
+    }
+    # Older installs record no urlAclCreated; a missing flag must read as
+    # false so uninstall never deletes a reservation it cannot prove is ours.
+    $aclProperty = $info.PSObject.Properties['urlAclCreated']
+    if ($null -eq $aclProperty) {
+        $info | Add-Member -NotePropertyName urlAclCreated -NotePropertyValue $false
+    }
+    elseif ($aclProperty.Value -isnot [bool]) {
+        throw "Install metadata at $path has an invalid urlAclCreated '$($info.urlAclCreated)'; it must be true or false. Fix the file."
+    }
+    $sddlProperty = $info.PSObject.Properties['urlAclSddl']
+    if ($null -eq $sddlProperty) {
+        $info | Add-Member -NotePropertyName urlAclSddl -NotePropertyValue $false
+    }
+    else {
+        $sddl = $sddlProperty.Value
+        $isValid = ($sddl -is [string] -and -not [string]::IsNullOrWhiteSpace($sddl)) -or
+            ($sddl -is [bool] -and -not $sddl)
+        if (-not $isValid) {
+            throw "Install metadata at $path has an invalid urlAclSddl '$sddl'; it must be an SDDL string or false. Fix the file."
+        }
+    }
+    if ($info.urlAclCreated -eq $true -and $info.urlAclSddl -isnot [string]) {
+        throw "Install metadata at $path records urlAclCreated but no urlAclSddl. Fix the file."
+    }
+    return $info
+}
+
 function Remove-ProctorData {
     [CmdletBinding(SupportsShouldProcess)]
     param([Parameter(Mandatory)][string]$DataDir)
 
-    if ((Test-Path $DataDir) -and $PSCmdlet.ShouldProcess($DataDir, 'remove proctor data')) {
+    if ((Test-Path -LiteralPath $DataDir -ErrorAction Stop) -and $PSCmdlet.ShouldProcess($DataDir, 'remove proctor data')) {
         Remove-Item $DataDir -Recurse -Force
     }
 }
@@ -738,6 +990,15 @@ function Install-KioskFile {
             Set-Content -Path $destination -Value $filled -Encoding UTF8
         }
     }
+
+    # The server and its module carry no template tokens and are copied as-is.
+    foreach ($source in 'src\server.ps1', 'proctor.psm1') {
+        $name = Split-Path $source -Leaf
+        $destination = Join-Path $Config.KioskDir $name
+        if ($PSCmdlet.ShouldProcess($destination, 'write file')) {
+            Copy-Item -Path (Join-Path $SourceRoot $source) -Destination $destination -Force
+        }
+    }
 }
 
 function Register-SyncTask {
@@ -771,13 +1032,205 @@ function Register-SyncTask {
         -Principal $principal -Settings $settings | Out-Null
 }
 
-function Remove-SyncTask {
+function Register-ServerTask {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][string]$TaskName,
+        [Parameter(Mandatory)][string]$ScriptPath,
+        [Parameter(Mandatory)][int]$Port
+    )
+
+    if (-not $PSCmdlet.ShouldProcess($TaskName, 'register scheduled task')) {
+        return
+    }
+
+    $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($existing) {
+        if ($existing.State -eq 'Running') {
+            Stop-ScheduledTask -TaskName $TaskName
+        }
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+    }
+
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+        -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ScriptPath`" -Port $Port"
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+
+    # SYSTEM decides the phase: the student account can neither change the
+    # clock the phase calculation trusts nor read the exam window early.
+    $principal = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
+        -ExecutionTimeLimit ([TimeSpan]::Zero)
+
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
+        -Principal $principal -Settings $settings | Out-Null
+}
+
+function Remove-ProctorTask {
     [CmdletBinding(SupportsShouldProcess)]
     param([Parameter(Mandatory)][string]$TaskName)
 
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($task -and $PSCmdlet.ShouldProcess($TaskName, 'unregister scheduled task')) {
+        if ($task.State -eq 'Running') {
+            Stop-ScheduledTask -TaskName $TaskName
+        }
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+    }
+}
+
+function Read-UrlAclRegistry {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param()
+
+    # HTTP.sys names each URL reservation value by the reserved URL. Its data
+    # is the SDDL as a string or a binary security descriptor, depending on
+    # the Windows build, so both are read as SDDL. Only a missing key means no
+    # reservations; any other read error throws.
+    $map = @{}
+    $path = 'HKLM:\SYSTEM\CurrentControlSet\Services\HTTP\Parameters\UrlAclInfo'
+    if (-not (Test-Path -LiteralPath $path -ErrorAction Stop)) {
+        return $map
+    }
+    $key = Get-Item -LiteralPath $path -ErrorAction Stop
+    foreach ($name in $key.GetValueNames()) {
+        $value = $key.GetValue($name)
+        if ($value -is [byte[]]) {
+            $value = (New-Object System.Security.AccessControl.RawSecurityDescriptor -ArgumentList $value, 0).GetSddlForm(
+                [System.Security.AccessControl.AccessControlSections]::All)
+        }
+        $map[$name] = [string]$value
+    }
+    return $map
+}
+
+function Get-UrlAclReservation {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Prefix)
+
+    # $null when no reservation exists; otherwise the stored prefix and the
+    # SDDL, for the caller's ownership decision and error messages.
+    $reservations = Read-UrlAclRegistry
+    $name = $reservations.Keys | Where-Object { $_ -ieq $Prefix } | Select-Object -First 1
+    if (-not $name) {
+        return $null
+    }
+    $sddl = $reservations[$name]
+    # User is only for messages: translate each SID, keep the SID on failure.
+    $user = [regex]::Matches($sddl, 'S-\d+(-\d+)*') | ForEach-Object {
+        try {
+            ([System.Security.Principal.SecurityIdentifier]$_.Value).Translate([System.Security.Principal.NTAccount]).Value
+        }
+        catch { $_.Value }
+    } | Select-Object -Unique
+    return [pscustomobject]@{ Prefix = $name; User = ($user -join ', '); Sddl = $sddl }
+}
+
+function Get-ProctorUrlAclSddl {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    # The exact ACL Proctor writes on the URL reservation: grant GENERIC
+    # EXECUTE (listen) to SYSTEM and nothing else. Ownership checks compare
+    # against this string, so it is also passed to netsh on create.
+    return 'D:(A;;GX;;;SY)'
+}
+
+function Get-UrlAclPlan {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [bool]$Exists,
+        [string]$Sddl,
+        $PriorInfo,
+        [Parameter(Mandatory)][int]$Port
+    )
+
+    # Proctor owns the reservation only when a previous install recorded
+    # that it created it for this same port and the current ACL still is
+    # exactly what install wrote. Anything else that exists may belong to
+    # another application or an administrator.
+    if (-not $Exists) {
+        return 'Create'
+    }
+    if ($null -ne $PriorInfo -and $PriorInfo.urlAclCreated -eq $true -and
+        [int]$PriorInfo.port -eq $Port -and
+        [string]$PriorInfo.urlAclSddl -eq $Sddl) {
+        return 'Keep'
+    }
+    return 'Fail'
+}
+
+function Test-PortChangeAllowed {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        $PriorInfo,
+        [Parameter(Mandatory)][int]$Port
+    )
+
+    # A recorded port is the port of a previous install: reinstalling on a
+    # different one would orphan its URL reservation, so it must refuse.
+    if ($null -eq $PriorInfo) {
+        return $true
+    }
+    return [int]$PriorInfo.port -eq $Port
+}
+
+function Add-KioskUrlAcl {
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)][string]$Prefix,
+        [Parameter(Mandatory)][ValidateSet('Create', 'Keep')][string]$Plan
+    )
+
+    # Returns $true when the reservation exists and is Proctor's after the
+    # call. 'Keep' means the caller already proved the existing reservation
+    # is Proctor's through install.json, so it must not be rewritten.
+    if (-not $PSCmdlet.ShouldProcess($Prefix, 'reserve URL for SYSTEM')) {
+        return $false
+    }
+    if ($Plan -eq 'Keep') {
+        return $true
+    }
+    & netsh.exe http add urlacl "url=$Prefix" "sddl=$(Get-ProctorUrlAclSddl)" | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "netsh could not reserve $Prefix for SYSTEM"
+    }
+    return $true
+}
+
+function Test-UrlAclRemoval {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        $InstallInfo,
+        [string]$Sddl
+    )
+
+    # Uninstall may delete the URL reservation only when this install wrote
+    # it and the ACL is still the exact SDDL install recorded; anything else
+    # belongs to another application or an administrator.
+    return ($null -ne $InstallInfo -and $InstallInfo.urlAclCreated -eq $true -and
+        [string]$InstallInfo.urlAclSddl -eq $Sddl)
+}
+
+function Remove-KioskUrlAcl {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([Parameter(Mandatory)][string]$Prefix)
+
+    if ($PSCmdlet.ShouldProcess($Prefix, 'remove URL reservation')) {
+        # The caller proves ownership through install.json before calling.
+        if (Get-UrlAclReservation -Prefix $Prefix) {
+            & netsh.exe http delete urlacl "url=$Prefix" | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                throw "netsh could not delete the reservation for $Prefix"
+            }
+        }
     }
 }
 
@@ -887,16 +1340,23 @@ function Remove-KioskFolder {
     [CmdletBinding(SupportsShouldProcess)]
     param([Parameter(Mandatory)][string]$Path)
 
-    if ((Test-Path $Path) -and $PSCmdlet.ShouldProcess($Path, 'remove kiosk folder')) {
+    if ((Test-Path -LiteralPath $Path -ErrorAction Stop) -and $PSCmdlet.ShouldProcess($Path, 'remove kiosk folder')) {
         Remove-Item $Path -Recurse -Force
     }
 }
 
 Export-ModuleMember -Function @(
+    'Get-ConfigValue',
     'Read-ProctorConfigFile',
     'Resolve-ProctorConfig',
     'Get-UninstallUserName',
     'Expand-ProctorTemplate',
+    'Get-ExamState',
+    'Test-ExamPdfServable',
+    'Resolve-ExamVersion',
+    'Get-ExamVersionsToPrune',
+    'Test-ExamVersionChanged',
+    'Test-UrlAclRemoval',
     'Get-LockdownMode',
     'Get-WindowsEditionId',
     'Get-EdgeInstallPath',
@@ -921,13 +1381,22 @@ Export-ModuleMember -Function @(
     'Remove-FirewallLockdown',
     'Set-ProctorDataAcl',
     'Install-ShareCredential',
+    'Save-ProctorInstallInfo',
+    'Read-ProctorInstallInfo',
     'Remove-ProctorData',
     'Invoke-SystemTask',
     'Set-AssignedAccessKiosk',
     'Clear-AssignedAccessKiosk',
     'Install-KioskFile',
     'Register-SyncTask',
-    'Remove-SyncTask',
+    'Register-ServerTask',
+    'Remove-ProctorTask',
+    'Get-UrlAclReservation',
+    'Get-ProctorUrlAclSddl',
+    'Get-UrlAclPlan',
+    'Test-PortChangeAllowed',
+    'Add-KioskUrlAcl',
+    'Remove-KioskUrlAcl',
     'Remove-UserLockdown',
     'Remove-StudentAccount',
     'Remove-KioskFolder'

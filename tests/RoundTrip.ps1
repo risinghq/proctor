@@ -8,6 +8,8 @@ $shareDir = 'C:\proctor-share'
 $deviceDir = Join-Path -Path $shareDir -ChildPath 'Device 01'
 $fixture = Join-Path -Path $root -ChildPath 'tests\fixtures\exam.pdf'
 $userName = 'Alumno-01'
+$kioskPort = 8472
+$kioskBase = "http://127.0.0.1:$kioskPort"
 $shareUser = 'proctor-share'
 $sharePassword = 'CI-Share-Read-Only-7'
 
@@ -17,6 +19,48 @@ function Assert-True {
         throw "ASSERT FAILED: $Message"
     }
     Write-Information "  ok: $Message"
+}
+
+function Get-KioskStatusCode {
+    param([string]$Url)
+    try {
+        return [int](Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 10).StatusCode
+    }
+    catch {
+        return [int]$_.Exception.Response.StatusCode
+    }
+}
+
+function Get-CurrentExamDir {
+    # The version folder the sync last published under the data dir; $null
+    # when the sync has never completed.
+    return Resolve-ExamVersion -DataDir 'C:\ProgramData\proctor'
+}
+
+function Invoke-SyncTask {
+    param([string]$TaskName)
+    Start-ScheduledTask -TaskName $TaskName
+    $deadline = (Get-Date).AddMinutes(2)
+    do {
+        Start-Sleep -Seconds 2
+        $task = Get-ScheduledTask -TaskName $TaskName
+    } while ($task.State -eq 'Running' -and (Get-Date) -lt $deadline)
+    if ($task.State -eq 'Running') { throw "$TaskName still running after 2 minutes" }
+    $info = Get-ScheduledTaskInfo -TaskName $TaskName
+    Write-Information "  LastTaskResult: $($info.LastTaskResult)"
+    if ($info.LastTaskResult -ne 0) {
+        Get-Content -Path 'C:\Kiosk\Logs\*.log' -ErrorAction SilentlyContinue
+        throw "sync task failed with result $($info.LastTaskResult)"
+    }
+}
+
+function Write-ExamJson {
+    param([datetimeoffset]$OpensAt, [datetimeoffset]$ClosesAt)
+    @{
+        title    = 'CI exam window'
+        opensAt  = $OpensAt.ToString('o')
+        closesAt = $ClosesAt.ToString('o')
+    } | ConvertTo-Json | Set-Content -Path (Join-Path $deviceDir 'exam.json') -Encoding UTF8
 }
 
 Import-Module (Join-Path -Path $root -ChildPath 'proctor.psm1') -Force
@@ -45,6 +89,7 @@ $configPath = Join-Path -Path $env:TEMP -ChildPath 'proctor-ci.json'
     examTitle    = 'CI exam'
     language     = 'en'
     shareUser    = $shareUser
+    port         = $kioskPort
 } | ConvertTo-Json | Set-Content -Path $configPath -Encoding UTF8
 
 $shareCredential = New-Object System.Management.Automation.PSCredential -ArgumentList $shareUser, $securePassword
@@ -147,7 +192,9 @@ try {
 }
 finally {
     try {
-        Set-LocalUser -Name $userName -Password (New-Object System.Security.SecureString)
+        # Set-LocalUser cannot set an empty password; ADSI can.
+        $account = [ADSI]"WinNT://$env:COMPUTERNAME/$userName,user"
+        $account.Invoke('SetPassword', '')
     } catch {
         Write-Warning "Could not restore the empty password: $($_.Exception.Message)"
     }
@@ -161,6 +208,8 @@ Assert-True (-not (Test-Path "Registry::HKEY_USERS\$sid")) 'probe left the stude
 
 Assert-True (Test-Path 'C:\Kiosk\index.html') 'index.html deployed'
 Assert-True (Test-Path 'C:\Kiosk\sync-exam.ps1') 'sync-exam.ps1 deployed'
+Assert-True (Test-Path 'C:\Kiosk\server.ps1') 'server.ps1 deployed'
+Assert-True (Test-Path 'C:\Kiosk\proctor.psm1') 'proctor.psm1 deployed'
 
 $kioskAcl = Get-Acl -Path 'C:\Kiosk'
 $studentRights = $kioskAcl.Access | Where-Object { $_.IdentityReference -match [regex]::Escape($userName) }
@@ -178,32 +227,171 @@ Assert-True ($null -ne $task) 'sync task registered'
 Assert-True ($task.Principal.LogonType -eq 'ServiceAccount') 'task logon type is ServiceAccount'
 Assert-True ($task.Principal.UserId -match 'SYSTEM') 'task runs as SYSTEM'
 
+$serverTask = Get-ScheduledTask -TaskName "ExamServer-$userName" -ErrorAction SilentlyContinue
+Assert-True ($null -ne $serverTask) 'server task registered'
+Assert-True ($serverTask.Principal.UserId -match 'SYSTEM') 'server task runs as SYSTEM'
+Assert-True ($serverTask.Triggers[0].CimClass.CimClassName -eq 'MSFT_TaskBootTrigger') 'server task starts at boot'
+Assert-True ($null -ne (Get-UrlAclReservation -Prefix "$kioskBase/")) 'URL ACL reserved for the kiosk port'
+
+Write-Information ''
+Write-Information 'Checking install refuses a different port...'
+$installJsonBefore = Get-Content -Path 'C:\ProgramData\proctor\install.json' -Raw
+$serverTaskBefore = (Get-ScheduledTask -TaskName "ExamServer-$userName").Actions[0].Arguments
+& powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -File (Join-Path -Path $root -ChildPath 'install.ps1') `
+    -Config $configPath -Port 8473
+Assert-True ($LASTEXITCODE -ne 0) 'install refuses a port change while installed'
+Assert-True (Test-Path 'C:\ProgramData\proctor\install.json') 'install metadata records the port'
+Assert-True ((Get-Content -Path 'C:\ProgramData\proctor\install.json' -Raw) -eq $installJsonBefore) 'refused install leaves install.json unchanged'
+Assert-True (((Get-ScheduledTask -TaskName "ExamServer-$userName").Actions[0].Arguments) -eq $serverTaskBefore) 'refused install leaves the server task unchanged'
+
+Write-Information ''
+Write-Information 'Checking install refuses a foreign URL reservation...'
+$proctorSddl = Get-ProctorUrlAclSddl
+& netsh.exe http delete urlacl "url=$kioskBase/" | Out-Null
+& netsh.exe http add urlacl "url=$kioskBase/" "sddl=D:(A;;GX;;;SY)(A;;GX;;;BA)" | Out-Null
+& powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -File (Join-Path -Path $root -ChildPath 'install.ps1') `
+    -Config $configPath
+Assert-True ($LASTEXITCODE -ne 0) 'install fails on a foreign URL reservation'
+Assert-True ($null -ne (Get-UrlAclReservation -Prefix "$kioskBase/")) 'foreign reservation untouched by install'
+Assert-True ((Get-Content -Path 'C:\ProgramData\proctor\install.json' -Raw) -eq $installJsonBefore) 'failed install leaves install.json unchanged'
+Assert-True (((Get-ScheduledTask -TaskName "ExamServer-$userName").Actions[0].Arguments) -eq $serverTaskBefore) 'failed install leaves the server task unchanged'
+& netsh.exe http delete urlacl "url=$kioskBase/" | Out-Null
+& netsh.exe http add urlacl "url=$kioskBase/" "sddl=$proctorSddl" | Out-Null
+
 Write-Information ''
 Write-Information 'Running the sync task...'
+Invoke-SyncTask -TaskName "ExamSync-$userName"
+Write-Information '  ok: sync task last result is 0'
+
+$examDir = Get-CurrentExamDir
+Assert-True ($null -ne $examDir) 'sync published an exam version'
+Assert-True (Test-Path (Join-Path $examDir 'Exam.pdf')) 'Exam.pdf was copied from the share'
+Assert-True (-not (Test-Path 'C:\Kiosk\Exam.pdf')) 'C:\Kiosk holds no readable Exam.pdf'
+Assert-True (-not (Test-Path 'C:\ProgramData\proctor\Exam.pdf')) 'no Exam.pdf at the data folder root'
+$localHash = (Get-FileHash -Path (Join-Path $examDir 'Exam.pdf') -Algorithm SHA256).Hash
+$fixtureHash = (Get-FileHash -Path $fixture -Algorithm SHA256).Hash
+Write-Information "  copied:  $localHash"
+Write-Information "  fixture: $fixtureHash"
+Assert-True ($localHash -eq $fixtureHash) 'copied PDF matches the fixture'
+
+Write-Information ''
+Write-Information 'Starting the kiosk server...'
+Start-ScheduledTask -TaskName "ExamServer-$userName"
+$ready = $false
+$deadline = (Get-Date).AddSeconds(60)
+do {
+    if ((Get-KioskStatusCode -Url "$kioskBase/state") -eq 200) {
+        $ready = $true
+    } else {
+        Start-Sleep -Seconds 2
+    }
+} while (-not $ready -and (Get-Date) -lt $deadline)
+Assert-True $ready '/state answers on the kiosk port'
+
+Write-Information ''
+Write-Information 'Checking the waiting phase...'
+Write-ExamJson -OpensAt (Get-Date).AddHours(1) -ClosesAt (Get-Date).AddHours(2)
+Invoke-SyncTask -TaskName "ExamSync-$userName"
+$examDir = Get-CurrentExamDir
+Assert-True ($null -ne $examDir) 'sync published an exam version'
+Assert-True (Test-Path (Join-Path $examDir 'exam.json')) 'exam.json was copied from the share'
+Assert-True (-not (Test-Path 'C:\Kiosk\exam.json')) 'C:\Kiosk holds no readable exam.json'
+# The version folder must inherit the data folder ACL: protected rules on
+# it would mean the student could be granted access separately.
+Assert-True (-not (Get-Acl -Path $examDir).AreAccessRulesProtected) 'exam version folder inherits the data folder ACL'
+$state = Invoke-RestMethod -Uri "$kioskBase/state" -TimeoutSec 10
+Assert-True ($state.phase -eq 'waiting') 'state is waiting before opensAt'
+Assert-True ($state.secondsUntilOpen -gt 0) 'waiting state counts the seconds to opensAt'
+Assert-True ((Get-KioskStatusCode -Url "$kioskBase/exam.pdf") -eq 404) 'exam.pdf is 404 while waiting'
+$dataAcl = Get-Acl -Path 'C:\ProgramData\proctor'
+Assert-True ($null -eq ($dataAcl.Access | Where-Object { $_.IdentityReference -match [regex]::Escape($sid) })) 'student has no ACE on the proctor data folder'
+
+Write-Information ''
+Write-Information 'Checking the open phase...'
+Write-ExamJson -OpensAt (Get-Date).AddHours(-1) -ClosesAt (Get-Date).AddHours(1)
+Invoke-SyncTask -TaskName "ExamSync-$userName"
+$state = Invoke-RestMethod -Uri "$kioskBase/state" -TimeoutSec 10
+Assert-True ($state.phase -eq 'open') 'state is open inside the window'
+Assert-True ($state.secondsLeft -gt 0) 'open state counts the seconds left'
+Assert-True (-not [string]::IsNullOrEmpty($state.pdfVersion)) 'open state reports the PDF version'
+Assert-True ((Get-KioskStatusCode -Url "$kioskBase/exam.pdf") -eq 200) 'exam.pdf is 200 while open'
+Invoke-WebRequest -Uri "$kioskBase/exam.pdf" -UseBasicParsing -TimeoutSec 10 -OutFile "$env:TEMP\rt-exam.pdf"
+$servedHash = (Get-FileHash -Path "$env:TEMP\rt-exam.pdf" -Algorithm SHA256).Hash
+Assert-True ($servedHash -eq $fixtureHash) 'served PDF matches the fixture'
+
+Write-Information ''
+Write-Information 'Checking the closed phase...'
+Write-ExamJson -OpensAt (Get-Date).AddHours(-2) -ClosesAt (Get-Date).AddHours(-1)
+Invoke-SyncTask -TaskName "ExamSync-$userName"
+$state = Invoke-RestMethod -Uri "$kioskBase/state" -TimeoutSec 10
+Assert-True ($state.phase -eq 'closed') 'state is closed after closesAt'
+Assert-True ((Get-KioskStatusCode -Url "$kioskBase/exam.pdf") -eq 404) 'exam.pdf is 404 after closesAt'
+
+Write-Information ''
+Write-Information 'Checking the error phase...'
+'{ not json' | Set-Content -Path (Join-Path $deviceDir 'exam.json') -Encoding UTF8
+Invoke-SyncTask -TaskName "ExamSync-$userName"
+$state = Invoke-RestMethod -Uri "$kioskBase/state" -TimeoutSec 10
+Assert-True ($state.phase -eq 'error') 'state is error on a malformed exam.json'
+Assert-True ((Get-KioskStatusCode -Url "$kioskBase/exam.pdf") -eq 404) 'exam.pdf is 404 on a broken schedule'
+
+'' | Set-Content -Path (Join-Path $deviceDir 'exam.json') -Encoding UTF8
+Invoke-SyncTask -TaskName "ExamSync-$userName"
+$state = Invoke-RestMethod -Uri "$kioskBase/state" -TimeoutSec 10
+Assert-True ($state.phase -eq 'error') 'state is error on an empty exam.json'
+Assert-True ((Get-KioskStatusCode -Url "$kioskBase/exam.pdf") -eq 404) 'exam.pdf is 404 on an empty schedule'
+
+'{ "metadata": { "opensAt": "2026-03-10T08:00:00+00:00", "closesAt": "2026-03-10T12:00:00+00:00" } }' |
+    Set-Content -Path (Join-Path $deviceDir 'exam.json') -Encoding UTF8
+Invoke-SyncTask -TaskName "ExamSync-$userName"
+$state = Invoke-RestMethod -Uri "$kioskBase/state" -TimeoutSec 10
+Assert-True ($state.phase -eq 'error') 'state is error on a nested-only schedule'
+Assert-True ((Get-KioskStatusCode -Url "$kioskBase/exam.pdf") -eq 404) 'exam.pdf is 404 on a nested-only schedule'
+Remove-Item -Path (Join-Path $deviceDir 'exam.json') -Force
+
+Write-Information ''
+Write-Information 'Checking a denied exam.json keeps the cached schedule...'
+Write-ExamJson -OpensAt (Get-Date).AddHours(-1) -ClosesAt (Get-Date).AddHours(1)
+Invoke-SyncTask -TaskName "ExamSync-$userName"
+$examDir = Get-CurrentExamDir
+Assert-True (Test-Path (Join-Path $examDir 'exam.json')) 'cached exam.json present before the denial'
+$shareExamJson = Join-Path $deviceDir 'exam.json'
+icacls.exe $shareExamJson /deny "${shareUser}:R" | Out-Null
 Start-ScheduledTask -TaskName "ExamSync-$userName"
 $deadline = (Get-Date).AddMinutes(2)
 do {
     Start-Sleep -Seconds 2
     $task = Get-ScheduledTask -TaskName "ExamSync-$userName"
 } while ($task.State -eq 'Running' -and (Get-Date) -lt $deadline)
-if ($task.State -eq 'Running') { throw "ExamSync-$userName still running after 2 minutes" }
-
 $info = Get-ScheduledTaskInfo -TaskName "ExamSync-$userName"
-Write-Information "  LastTaskResult: $($info.LastTaskResult)"
-if ($info.LastTaskResult -ne 0) {
-    Get-Content -Path 'C:\Kiosk\Logs\*.log' -ErrorAction SilentlyContinue
-    Get-WinEvent -LogName 'Microsoft-Windows-TaskScheduler/Operational' -MaxEvents 30 |
-        Format-Table TimeCreated, Id, Message -AutoSize | Out-String -Width 300
-    throw "sync task failed with result $($info.LastTaskResult)"
-}
-Write-Information '  ok: sync task last result is 0'
+Assert-True ($info.LastTaskResult -ne 0) 'sync task fails when exam.json is unreadable'
+Assert-True ((Get-CurrentExamDir) -eq $examDir) 'failed sync keeps the previous version current'
+Assert-True (Test-Path (Join-Path $examDir 'exam.json')) 'cached exam.json kept on a denied share file'
+icacls.exe $shareExamJson /remove:d $shareUser | Out-Null
+Remove-Item -Path $shareExamJson -Force
+Invoke-SyncTask -TaskName "ExamSync-$userName"
+$examDir = Get-CurrentExamDir
+Assert-True (-not (Test-Path (Join-Path $examDir 'exam.json'))) 'cached exam.json removed when the source file is deleted'
 
-Assert-True (Test-Path 'C:\Kiosk\Exam.pdf') 'Exam.pdf was copied from the share'
-$localHash = (Get-FileHash -Path 'C:\Kiosk\Exam.pdf' -Algorithm SHA256).Hash
-$fixtureHash = (Get-FileHash -Path $fixture -Algorithm SHA256).Hash
-Write-Information "  copied:  $localHash"
-Write-Information "  fixture: $fixtureHash"
-Assert-True ($localHash -eq $fixtureHash) 'copied PDF matches the fixture'
+Write-Information ''
+Write-Information 'Checking the sync publishes a consistent version pair...'
+Write-ExamJson -OpensAt (Get-Date).AddHours(-1) -ClosesAt (Get-Date).AddHours(1)
+Invoke-SyncTask -TaskName "ExamSync-$userName"
+Assert-True ((Get-KioskStatusCode -Url "$kioskBase/exam.pdf") -eq 200) 'exam.pdf is served on an open schedule'
+$previousDir = Get-CurrentExamDir
+Write-ExamJson -OpensAt (Get-Date).AddHours(1) -ClosesAt (Get-Date).AddHours(2)
+Invoke-SyncTask -TaskName "ExamSync-$userName"
+$examDir = Get-CurrentExamDir
+Assert-True ($examDir -ne $previousDir) 'new schedule published under a new version folder'
+Assert-True (Test-Path (Join-Path $examDir 'exam.json')) 'new version holds the schedule'
+Assert-True (Test-Path (Join-Path $examDir 'Exam.pdf')) 'new version holds the PDF'
+Assert-True (Test-Path $previousDir) 'the version before the current one is kept'
+$versionCount = @(Get-ChildItem -Path 'C:\ProgramData\proctor\exam' -Directory).Count
+Assert-True ($versionCount -le 2) 'older versions are pruned'
+$state = Invoke-RestMethod -Uri "$kioskBase/state" -TimeoutSec 10
+Assert-True ($state.phase -eq 'waiting') 'state is waiting after the future schedule lands'
+Assert-True ((Get-KioskStatusCode -Url "$kioskBase/exam.pdf") -eq 404) 'exam.pdf stays 404 on the future schedule'
+Remove-Item -Path (Join-Path $deviceDir 'exam.json') -Force
 
 Write-Information ''
 Write-Information 'Checking the sync task fails without share access...'
@@ -223,11 +411,26 @@ if ($task.State -eq 'Running') { throw "ExamSync-$userName still running after 2
 $info = Get-ScheduledTaskInfo -TaskName "ExamSync-$userName"
 Write-Information "  LastTaskResult: $($info.LastTaskResult)"
 Assert-True ($info.LastTaskResult -ne 0) 'sync task fails with a bad credential'
-Assert-True (Test-Path 'C:\Kiosk\Exam.pdf') 'Exam.pdf survives an unreachable share'
+$examDir = Get-CurrentExamDir
+Assert-True ($null -ne $examDir -and (Test-Path (Join-Path $examDir 'Exam.pdf'))) 'Exam.pdf survives an unreachable share'
 
 Install-ShareCredential -Credential $shareCredential -DataDir 'C:\ProgramData\proctor'
 
 Write-Information ''
+Write-Information 'Checking uninstall refuses a corrupt install record...'
+'{ bad json' | Set-Content -Path 'C:\ProgramData\proctor\install.json' -Encoding UTF8
+& powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -File (Join-Path -Path $root -ChildPath 'uninstall.ps1') -Force -UserName $userName
+Assert-True ($LASTEXITCODE -ne 0) 'uninstall fails on corrupt install metadata'
+Assert-True ($null -ne (Get-UrlAclReservation -Prefix "$kioskBase/")) 'URL ACL survives the failed uninstall'
+
+$sddl = Get-ProctorUrlAclSddl
+'{ "port": ' + $kioskPort + ', "urlAclCreated": true, "urlAclSddl": "' + $sddl + '" }' |
+    Set-Content -Path 'C:\ProgramData\proctor\install.json' -Encoding UTF8
+
+Write-Information ''
+Write-Information (& netsh.exe http show urlacl "url=$kioskBase/" | Out-String)
+$registryReservation = Get-UrlAclReservation -Prefix "$kioskBase/"
+Write-Information "  registry reservation: $($registryReservation.Sddl)"
 [gc]::Collect()
 [gc]::WaitForPendingFinalizers()
 Write-Information 'Running uninstall.ps1...'
@@ -236,6 +439,8 @@ Assert-True ($LASTEXITCODE -eq 0) 'uninstall.ps1 exits 0'
 
 Write-Information 'Checking the laptop is back to a clean state...'
 Assert-True ($null -eq (Get-ScheduledTask -TaskName "ExamSync-$userName" -ErrorAction SilentlyContinue)) 'sync task removed'
+Assert-True ($null -eq (Get-ScheduledTask -TaskName "ExamServer-$userName" -ErrorAction SilentlyContinue)) 'server task removed'
+Assert-True ($null -eq (Get-UrlAclReservation -Prefix "$kioskBase/")) 'URL ACL removed'
 Assert-True ($null -eq (Get-NetFirewallRule -DisplayName "BlockInternet-$userName" -ErrorAction SilentlyContinue)) 'block rule removed'
 Assert-True ($null -eq (Get-LocalUser -Name $userName -ErrorAction SilentlyContinue)) 'student account removed'
 Assert-True ($null -eq (Get-CimInstance Win32_UserProfile -Filter "SID='$sid'" -ErrorAction SilentlyContinue)) 'profile removed'
@@ -245,6 +450,19 @@ Assert-True (-not (Test-Path 'C:\ProgramData\proctor')) 'C:\ProgramData\proctor 
 
 $winlogon = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
 Assert-True ($winlogon.AutoAdminLogon -ne '1') 'auto-logon cleared'
+
+Write-Information ''
+Write-Information 'Checking uninstall leaves a reservation whose ACL changed...'
+New-Item -Path 'C:\ProgramData\proctor' -ItemType Directory -Force | Out-Null
+'{ "port": ' + $kioskPort + ', "urlAclCreated": true, "urlAclSddl": "' + $sddl + '" }' |
+    Set-Content -Path 'C:\ProgramData\proctor\install.json' -Encoding UTF8
+& netsh.exe http add urlacl "url=$kioskBase/" "sddl=D:(A;;GX;;;SY)(A;;GX;;;BA)" | Out-Null
+& powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -File (Join-Path -Path $root -ChildPath 'uninstall.ps1') -Force -UserName $userName
+Assert-True ($LASTEXITCODE -eq 0) 'uninstall exits 0 on a changed reservation ACL'
+Assert-True ($null -ne (Get-UrlAclReservation -Prefix "$kioskBase/")) 'reservation with a different ACL survives uninstall'
+& netsh.exe http delete urlacl "url=$kioskBase/" | Out-Null
+Assert-True ($null -eq (Get-UrlAclReservation -Prefix "$kioskBase/")) 'URL ACL removed'
+Assert-True (-not (Test-Path 'C:\ProgramData\proctor')) 'C:\ProgramData\proctor removed again'
 
 Remove-SmbShare -Name $shareName -Force
 Remove-LocalUser -Name $shareUser
