@@ -793,6 +793,49 @@ function Remove-UserLockdown {
     }
 }
 
+function Stop-UserSession {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([Parameter(Mandatory)][string]$UserName)
+
+    # quser prints one row per session: USERNAME, optional SESSIONNAME, ID, ...
+    $rows = & quser.exe 2>$null | Select-Object -Skip 1
+    foreach ($row in $rows) {
+        if ($row -match '^\s*>?(\S+)\s+(?:\S+\s+)?(\d+)\s+' -and $Matches[1] -eq $UserName) {
+            if ($PSCmdlet.ShouldProcess($UserName, "log off session $($Matches[2])")) {
+                & logoff.exe $Matches[2]
+            }
+        }
+    }
+}
+
+function Remove-UserProfile {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][string]$Sid,
+        [int]$TimeoutSeconds = 60
+    )
+
+    # The User Profile Service unloads a hive some seconds after its last
+    # logon session ends; until then deletion fails with 0x80070020.
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($true) {
+        $userProfile = Get-CimInstance Win32_UserProfile -Filter "SID='$Sid'" -ErrorAction SilentlyContinue
+        if ($null -eq $userProfile -or -not $PSCmdlet.ShouldProcess($Sid, 'remove profile')) {
+            return
+        }
+        try {
+            $userProfile | Remove-CimInstance -ErrorAction Stop
+            return
+        }
+        catch {
+            if ((Get-Date) -ge $deadline) {
+                throw "Profile $Sid is still loaded after $TimeoutSeconds s: $($_.Exception.Message)"
+            }
+            Start-Sleep -Seconds 3
+        }
+    }
+}
+
 function Remove-StudentAccount {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -808,10 +851,8 @@ function Remove-StudentAccount {
         return
     }
 
-    $existingProfile = Get-CimInstance Win32_UserProfile -Filter "SID='$($user.SID.Value)'" -ErrorAction SilentlyContinue
-    if ($existingProfile) {
-        $existingProfile | Remove-CimInstance
-    }
+    Stop-UserSession -UserName $UserName
+    Remove-UserProfile -Sid $user.SID.Value
 
     Remove-LocalUser -Name $UserName
 
