@@ -30,8 +30,22 @@
             font-size: 0.9rem;
             color: #4a4a4a;
         }
-        .waiting {
-            display: flex;
+        .timer {
+            position: absolute;
+            top: 24px;
+            left: 24px;
+            background: rgba(0, 0, 0, 0.8);
+            padding: 10px 20px;
+            border-radius: 6px;
+            font-weight: 600;
+            font-size: 1.2rem;
+            font-variant-numeric: tabular-nums;
+            color: #fff;
+            display: none;
+            z-index: 2;
+        }
+        .screen {
+            display: none;
             flex-direction: column;
             align-items: center;
             gap: 2rem;
@@ -39,6 +53,12 @@
         }
         h1 { font-weight: 700; font-size: 2.5rem; color: #000; }
         p { font-size: 1rem; color: #5a5a5a; }
+        .countdown {
+            font-size: 3.5rem;
+            font-weight: 700;
+            font-variant-numeric: tabular-nums;
+            color: #000;
+        }
         .loader {
             width: 40px;
             height: 40px;
@@ -61,6 +81,7 @@
             border: none;
             background: #fff;
             display: none;
+            z-index: 1;
         }
         @keyframes spin { to { transform: rotate(360deg); } }
         @keyframes pulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
@@ -68,11 +89,21 @@
 </head>
 <body oncontextmenu="return false;">
     <div class="badge">{{UserName}}</div>
-    <div class="waiting" id="waiting">
-        <h1>{{ExamTitle}}</h1>
+    <div class="timer" id="timer"></div>
+    <div class="screen" id="waiting">
+        <h1 class="exam-title">{{ExamTitle}}</h1>
         <p id="instructions"></p>
-        <div class="loader"></div>
+        <div class="countdown" id="opensIn"></div>
+        <div class="loader" id="loader"></div>
         <div class="status" id="status"></div>
+    </div>
+    <div class="screen" id="closed">
+        <h1 class="exam-title">{{ExamTitle}}</h1>
+        <p id="timeUp"></p>
+    </div>
+    <div class="screen" id="error">
+        <h1 class="exam-title">{{ExamTitle}}</h1>
+        <p id="scheduleError"></p>
     </div>
     <iframe id="pdf"></iframe>
 
@@ -81,40 +112,127 @@
         const MESSAGES = {
             es: {
                 instructions: 'Por favor, espere las instrucciones del docente para comenzar el examen',
-                status: 'Esperando examen...'
+                waiting: 'Esperando examen...',
+                opensIn: 'El examen comienza en',
+                timeLeft: 'Tiempo restante',
+                timeUp: 'El tiempo del examen ha terminado',
+                scheduleError: 'Error en el horario del examen. Avise al docente.'
             },
             en: {
                 instructions: 'Please wait for the teacher\'s instructions to begin the exam',
-                status: 'Waiting for the exam...'
+                waiting: 'Waiting for the exam...',
+                opensIn: 'The exam starts in',
+                timeLeft: 'Time remaining',
+                timeUp: 'The exam time has ended',
+                scheduleError: 'There is an error in the exam schedule. Please notify the proctor.'
             }
         };
         const strings = MESSAGES[LANG] || MESSAGES.es;
-        document.getElementById('instructions').textContent = strings.instructions;
-        document.getElementById('status').textContent = strings.status;
 
         const iframe = document.getElementById('pdf');
         const waiting = document.getElementById('waiting');
-        let pollInterval = null;
+        const closed = document.getElementById('closed');
+        const errorScreen = document.getElementById('error');
+        const timer = document.getElementById('timer');
+        const opensIn = document.getElementById('opensIn');
+        const loader = document.getElementById('loader');
+        const instructions = document.getElementById('instructions');
+        const status = document.getElementById('status');
 
-        iframe.onload = function() {
-            if (iframe.src === '' || iframe.src === 'about:blank') return;
+        let phase = 'none';
+        let secondsUntilOpen = null;
+        let secondsLeft = null;
+        let pdfVersion = null;
+        let loadedVersion = null;
 
-            setTimeout(function() {
-                if (iframe.contentWindow.length === 1) {
-                    iframe.style.display = 'block';
-                    waiting.style.display = 'none';
-                    clearInterval(pollInterval);
-                    pollInterval = null;
-                }
-            }, 100);
-        };
+        document.getElementById('timeUp').textContent = strings.timeUp;
+        document.getElementById('scheduleError').textContent = strings.scheduleError;
 
-        function checkForPDF() {
-            iframe.src = 'Exam.pdf?t=' + Date.now() + '#toolbar=0&navpanes=0';
+        function formatClock(totalSeconds) {
+            const s = Math.max(0, Math.floor(totalSeconds));
+            const h = Math.floor(s / 3600);
+            const m = Math.floor((s % 3600) / 60);
+            const sec = s % 60;
+            const mm = String(m).padStart(2, '0');
+            const ss = String(sec).padStart(2, '0');
+            return h > 0 ? h + ':' + mm + ':' + ss : mm + ':' + ss;
         }
 
-        checkForPDF();
-        pollInterval = setInterval(checkForPDF, 5000);
+        function setTitle(title) {
+            document.title = title;
+            document.querySelectorAll('.exam-title').forEach(function(el) {
+                el.textContent = title;
+            });
+        }
+
+        function render() {
+            const showPdf = (phase === 'open' || phase === 'none') && pdfVersion !== null;
+            const showWaiting = phase === 'waiting' || (phase === 'none' && pdfVersion === null);
+            const scheduled = phase === 'waiting' && secondsUntilOpen !== null;
+
+            waiting.style.display = showWaiting ? 'flex' : 'none';
+            closed.style.display = phase === 'closed' ? 'flex' : 'none';
+            errorScreen.style.display = phase === 'error' ? 'flex' : 'none';
+            timer.style.display = phase === 'open' ? 'block' : 'none';
+
+            instructions.textContent = scheduled ? strings.opensIn : strings.instructions;
+            opensIn.style.display = scheduled ? 'block' : 'none';
+            opensIn.textContent = scheduled ? formatClock(secondsUntilOpen) : '';
+            loader.style.display = scheduled ? 'none' : 'block';
+            status.textContent = scheduled ? '' : strings.waiting;
+
+            if (showPdf) {
+                if (loadedVersion !== pdfVersion) {
+                    iframe.src = '/exam.pdf?v=' + encodeURIComponent(pdfVersion) + '#toolbar=0&navpanes=0';
+                    loadedVersion = pdfVersion;
+                }
+                iframe.style.display = 'block';
+            } else {
+                iframe.style.display = 'none';
+                if (loadedVersion !== null) {
+                    iframe.src = 'about:blank';
+                    loadedVersion = null;
+                }
+            }
+
+            if (phase === 'open' && secondsLeft !== null) {
+                timer.textContent = strings.timeLeft + ' ' + formatClock(secondsLeft);
+            }
+        }
+
+        function tick() {
+            if (phase === 'waiting' && secondsUntilOpen !== null && secondsUntilOpen > 0) {
+                secondsUntilOpen--;
+                opensIn.textContent = formatClock(secondsUntilOpen);
+            }
+            if (phase === 'open' && secondsLeft !== null && secondsLeft > 0) {
+                secondsLeft--;
+                timer.textContent = strings.timeLeft + ' ' + formatClock(secondsLeft);
+            }
+        }
+
+        function poll() {
+            fetch('/state', { cache: 'no-store' })
+                .then(function(response) {
+                    if (!response.ok) return null;
+                    return response.json();
+                })
+                .then(function(state) {
+                    if (!state) return;
+                    phase = state.phase;
+                    secondsUntilOpen = state.secondsUntilOpen;
+                    secondsLeft = state.secondsLeft;
+                    pdfVersion = state.pdfVersion;
+                    if (state.title) setTitle(state.title);
+                    render();
+                })
+                .catch(function() {});
+        }
+
+        render();
+        poll();
+        setInterval(poll, 3000);
+        setInterval(tick, 1000);
     </script>
 </body>
 </html>

@@ -3,9 +3,14 @@ $ErrorActionPreference = "Stop"
 $kioskPath = "C:\Kiosk"
 $logsPath = "$kioskPath\Logs"
 $networkPath = '{{NetworkPath}}'
-$credFile = "C:\ProgramData\proctor\share.cred"
-$localPdf = "$kioskPath\Exam.pdf"
+# Exam content goes to the data folder: its ACL allows SYSTEM and
+# Administrators only, so the student cannot read the PDF before it opens.
+$dataPath = "C:\ProgramData\proctor"
+$examRoot = "$dataPath\exam"
+$credFile = "$dataPath\share.cred"
 $logFile = "$logsPath\sync_$(Get-Date -Format 'yyyyMMdd').log"
+
+Import-Module (Join-Path $PSScriptRoot 'proctor.psm1') -Force
 
 function Write-SyncLog {
     param([string]$level, [string]$message)
@@ -60,36 +65,62 @@ try {
             throw "Share not reachable: $parent"
         }
         $networkPdf = $null
+        $networkExamJson = $null
     } else {
         $networkPdf = Get-NetworkPdf -path $examPath
-    }
-
-    # Mirror local state to network state
-    if ($null -eq $networkPdf) {
-        if (Test-Path $localPdf) {
-            Remove-Item $localPdf -Force
-            Write-SyncLog "INFO" "PDF local eliminado (red vacia)"
+        # Null means "confirmed absent": the folder is reachable and
+        # Test-Path reports the file is gone with no error. Any access or
+        # read error throws instead, so a denied exam.json keeps the cached
+        # schedule rather than failing open to an unscheduled exam.
+        $examJsonShare = Join-Path $examPath 'exam.json'
+        $networkExamJson = $null
+        if (Test-Path $examJsonShare -ErrorAction Stop) {
+            $networkExamJson = Get-Item -Path $examJsonShare -ErrorAction Stop
         }
-        exit 0
     }
 
-    $needsCopy = $false
+    # A new version lands in its own folder and becomes visible only when
+    # current.txt is swapped, so a request always sees a consistent
+    # exam.json/Exam.pdf pair. A failure before the swap changes nothing.
+    $currentDir = Resolve-ExamVersion -DataDir $dataPath
+    if (Test-ExamVersionChanged -CurrentDir $currentDir -NetworkPdf $networkPdf -NetworkExamJson $networkExamJson) {
+        $versionName = Get-Date -Format 'yyyyMMddHHmmssfff'
+        $newDir = Join-Path $examRoot $versionName
+        try {
+            New-Item -Path $newDir -ItemType Directory -Force | Out-Null
+            if ($networkPdf) {
+                Copy-Item -Path $networkPdf.FullName -Destination (Join-Path $newDir 'Exam.pdf') -Force
+                Write-SyncLog "INFO" "Exam.pdf synced: $($networkPdf.Name)"
+            }
+            if ($networkExamJson) {
+                Copy-Item -Path $networkExamJson.FullName -Destination (Join-Path $newDir 'exam.json') -Force
+                Write-SyncLog "INFO" "exam.json synced"
+            }
+        } catch {
+            Remove-Item -Path $newDir -Recurse -Force -ErrorAction SilentlyContinue
+            throw
+        }
 
-    if (!(Test-Path $localPdf)) {
-        $needsCopy = $true
+        $tmp = Join-Path $examRoot 'current.tmp'
+        $pointer = Join-Path $examRoot 'current.txt'
+        Set-Content -Path $tmp -Value $versionName -NoNewline -Encoding ASCII
+        if (Test-Path $pointer) {
+            [System.IO.File]::Replace($tmp, $pointer, $null)
+        } else {
+            Move-Item -Path $tmp -Destination $pointer -Force
+        }
+        Write-SyncLog "INFO" "published version $versionName"
+
+        $names = (Get-ChildItem -Path $examRoot -Directory).Name
+        foreach ($old in Get-ExamVersionsToPrune -Names $names -Current $versionName) {
+            Remove-Item -Path (Join-Path $examRoot $old) -Recurse -Force
+        }
     } else {
-        $localHash = (Get-FileHash $localPdf -Algorithm SHA256).Hash
-        $networkHash = (Get-FileHash $networkPdf.FullName -Algorithm SHA256).Hash
-        $needsCopy = $localHash -ne $networkHash
-    }
-
-    if ($needsCopy) {
-        Copy-Item -Path $networkPdf.FullName -Destination $localPdf -Force
-        Write-SyncLog "INFO" "PDF sincronizado: $($networkPdf.Name)"
+        Write-SyncLog "INFO" "exam files unchanged"
     }
 } catch {
     try {
-        Write-SyncLog "ERROR" "Fallo de sincronizacion: $($_.Exception.Message)"
+        Write-SyncLog "ERROR" "Sync failed: $($_.Exception.Message)"
     } catch {
         Write-Error $_
     }
