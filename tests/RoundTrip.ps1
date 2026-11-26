@@ -19,49 +19,6 @@ function Assert-True {
     Write-Information "  ok: $Message"
 }
 
-function Set-StudentBatchRight {
-    [CmdletBinding(SupportsShouldProcess)]
-    param([Parameter(Mandatory)][string]$AccountSid, [switch]$Revoke)
-
-    $cfg = Join-Path $env:TEMP 'proctor-batch-right.inf'
-    & secedit.exe /export /cfg $cfg /areas USER_RIGHTS | Out-Null
-    $marker = "*$AccountSid"
-    $lines = [System.Collections.Generic.List[string]]@(Get-Content $cfg)
-    $found = $false
-    for ($i = 0; $i -lt $lines.Count; $i++) {
-        if ($lines[$i] -match '^\s*SeBatchLogonRight\s*=') {
-            $found = $true
-            $sids = @(($lines[$i] -split '=', 2)[1] -split '\s*,\s*' | Where-Object { $_ })
-            if ($Revoke) {
-                $sids = @($sids | Where-Object { $_ -ne $marker })
-            } elseif ($sids -notcontains $marker) {
-                $sids += $marker
-            }
-            $lines[$i] = "SeBatchLogonRight = $($sids -join ',')"
-        }
-    }
-    if (-not $found -and -not $Revoke) {
-        $idx = $lines.IndexOf('[Privilege Rights]')
-        if ($idx -lt 0) {
-            $lines.Add('[Privilege Rights]')
-            $idx = $lines.Count - 1
-        }
-        $lines.Insert($idx + 1, "SeBatchLogonRight = $marker")
-    }
-    $lines | Set-Content $cfg
-    if ($PSCmdlet.ShouldProcess($AccountSid, 'set SeBatchLogonRight')) {
-        & secedit.exe /configure /db (Join-Path $env:TEMP 'proctor-batch.sdb') /cfg $cfg /areas USER_RIGHTS | Out-Null
-    }
-}
-
-function Get-StudentBatchRight {
-    param([Parameter(Mandatory)][string]$AccountSid)
-    $cfg = Join-Path $env:TEMP 'proctor-batch-check.inf'
-    & secedit.exe /export /cfg $cfg /areas USER_RIGHTS | Out-Null
-    $line = Get-Content $cfg | Where-Object { $_ -match '^\s*SeBatchLogonRight\s*=' }
-    return ($null -ne $line -and $line -match [regex]::Escape("*$AccountSid"))
-}
-
 Import-Module (Join-Path -Path $root -ChildPath 'proctor.psm1') -Force
 
 Write-Information 'Setting up the exam share...'
@@ -175,47 +132,31 @@ try {
 }
 "@ | Set-Content -Path $probeScript -Encoding UTF8
 
-$probeTask = 'ProctorFirewallProbe'
-$probeAction = New-ScheduledTaskAction -Execute 'powershell.exe' `
-    -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$probeScript`""
+# Start-Process -Credential logs on without loading the student profile, so
+# the hive stays unloaded and uninstall can delete the profile afterwards.
 $probePasswordPlain = "P!$([guid]::NewGuid().ToString('N').Substring(0, 16))"
-$probePassword = New-Object System.Security.SecureString
-foreach ($c in $probePasswordPlain.ToCharArray()) { $probePassword.AppendChar($c) }
-
+$probePassword = ConvertTo-SecureString $probePasswordPlain -AsPlainText -Force
 Set-LocalUser -Name $userName -Password $probePassword
-Set-StudentBatchRight -AccountSid $sid
 try {
-    Register-ScheduledTask -TaskName $probeTask -Action $probeAction `
-        -User $userName -Password $probePasswordPlain -RunLevel Limited | Out-Null
-    try {
-        Start-ScheduledTask -TaskName $probeTask
-        $deadline = (Get-Date).AddMinutes(2)
-        do {
-            Start-Sleep -Seconds 2
-            $probe = Get-ScheduledTask -TaskName $probeTask
-        } while ($probe.State -eq 'Running' -and (Get-Date) -lt $deadline)
-        if ($probe.State -eq 'Running') { throw 'Probe task still running after 2 minutes' }
-        $probeInfo = Get-ScheduledTaskInfo -TaskName $probeTask
-        Write-Information "  probe task LastTaskResult: $($probeInfo.LastTaskResult)"
-    }
-    finally {
-        Unregister-ScheduledTask -TaskName $probeTask -Confirm:$false -ErrorAction SilentlyContinue
-        try {
-            Set-LocalUser -Name $userName -Password (New-Object System.Security.SecureString)
-        } catch {
-            Write-Warning "Could not restore the empty password: $($_.Exception.Message)"
-        }
-    }
+    $probeCredential = New-Object System.Management.Automation.PSCredential($userName, $probePassword)
+    $probeProcess = Start-Process -FilePath 'powershell.exe' -Credential $probeCredential `
+        -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$probeScript`"" `
+        -WorkingDirectory 'C:\Users\Public' -WindowStyle Hidden -Wait -PassThru
+    Write-Information "  probe exit code: $($probeProcess.ExitCode)"
 }
 finally {
-    Set-StudentBatchRight -AccountSid $sid -Revoke
+    try {
+        Set-LocalUser -Name $userName -Password (New-Object System.Security.SecureString)
+    } catch {
+        Write-Warning "Could not restore the empty password: $($_.Exception.Message)"
+    }
 }
-Assert-True (-not (Get-StudentBatchRight -AccountSid $sid)) 'SeBatchLogonRight revoked after the probe'
 
 $probeOut = Get-Content -Path $probeResult -TotalCount 1 -ErrorAction SilentlyContinue
 Write-Information "  probe result: $probeOut"
-Assert-True ($probeInfo.LastTaskResult -eq 0) "probe task ran (result $($probeInfo.LastTaskResult))"
+Assert-True ($probeProcess.ExitCode -eq 0) "probe ran (exit $($probeProcess.ExitCode))"
 Assert-True ($probeOut -eq 'blocked') 'student cannot open an outbound connection'
+Assert-True (-not (Test-Path "Registry::HKEY_USERS\$sid")) 'probe left the student hive unloaded'
 
 Assert-True (Test-Path 'C:\Kiosk\index.html') 'index.html deployed'
 Assert-True (Test-Path 'C:\Kiosk\sync-exam.ps1') 'sync-exam.ps1 deployed'
