@@ -1,0 +1,8 @@
+[tasks.lint]
+run = 'pwsh -NoProfile -File ./tools/check.ps1 -Task lint'
+
+[tasks.test]
+run = 'pwsh -NoProfile -File ./tools/check.ps1 -Task test'
+
+[tasks.check]
+depends = ["lint", "test"]

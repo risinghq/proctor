@@ -1,0 +1,9 @@
+{
+  "server": "192.168.5.30",
+  "share": "sidera/Examenes",
+  "userPrefix": "Alumno",
+  "deviceNumber": "01",
+  "examTitle": "Examen de certificacion",
+  "language": "es",
+  "shareUser": "proctor-lectura"
+}
