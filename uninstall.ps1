@@ -80,11 +80,15 @@ Invoke-Step 'Removed kiosk server task and URL reservation' {
     $reservation = Get-UrlAclReservation -Prefix $prefix
     if (Test-UrlAclRemoval -InstallInfo $installInfo -Sddl $reservation.Sddl) {
         Remove-KioskUrlAcl -Prefix $prefix
+        Write-Information "  removed URL reservation $prefix"
     }
-    elseif ($reservation -and $installInfo -and $installInfo.urlAclCreated) {
-        # A changed ACL is not an error: an administrator may have replaced
-        # it, and the laptop is still clean of Proctor's own state.
+    elseif ($reservation) {
+        # A reservation that is not Proctor's own is not an error: the
+        # laptop is still clean of Proctor's state, but never stay silent.
         Write-Warning "URL prefix $prefix is reserved with a different ACL ($($reservation.Sddl)); leaving it in place."
+    }
+    else {
+        Write-Information "  no URL reservation on $prefix"
     }
 }
 

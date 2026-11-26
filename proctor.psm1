@@ -1086,12 +1086,17 @@ function Get-UrlAclReservation {
 
     # $null when no reservation exists; otherwise the prefix and the account
     # it grants, for the caller's ownership decision and error messages.
-    $show = & netsh.exe http show urlacl "url=$Prefix" 2>$null
-    if ($show -notmatch 'Reserved URL') {
+    # The url= lookup form can miss a stored reservation, so this parses the
+    # full listing and takes the block whose Reserved URL is the prefix.
+    $show = & netsh.exe http show urlacl 2>$null
+    $block = $show | Select-String -Pattern "Reserved URL\s*:\s*$([regex]::Escape($Prefix))\s*$" -Context 0, 8 |
+        Select-Object -First 1
+    if (-not $block) {
         return $null
     }
-    $user = ($show | Select-String -Pattern 'User:\s*(\S.*)' | Select-Object -First 1).Matches.Groups[1].Value
-    $sddl = ($show | Select-String -Pattern 'SDDL:\s*(\S.*)' | Select-Object -First 1).Matches.Groups[1].Value
+    $lines = @($block.Line) + @($block.Context.PostContext)
+    $user = ($lines | Select-String -Pattern 'User:\s*(\S.*)' | Select-Object -First 1).Matches.Groups[1].Value
+    $sddl = ($lines | Select-String -Pattern 'SDDL:\s*(\S.*)' | Select-Object -First 1).Matches.Groups[1].Value
     return [pscustomobject]@{ Prefix = $Prefix; User = $user; Sddl = ([string]$sddl).Trim() }
 }
 
@@ -1192,9 +1197,11 @@ function Remove-KioskUrlAcl {
 
     if ($PSCmdlet.ShouldProcess($Prefix, 'remove URL reservation')) {
         # The caller proves ownership through install.json before calling.
-        $show = & netsh.exe http show urlacl "url=$Prefix" 2>$null
-        if ($show -match 'Reserved URL') {
+        if (Get-UrlAclReservation -Prefix $Prefix) {
             & netsh.exe http delete urlacl "url=$Prefix" | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                throw "netsh could not delete the reservation for $Prefix"
+            }
         }
     }
 }

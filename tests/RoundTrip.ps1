@@ -192,7 +192,9 @@ try {
 }
 finally {
     try {
-        Set-LocalUser -Name $userName -Password (New-Object System.Security.SecureString)
+        # Set-LocalUser cannot set an empty password; ADSI can.
+        $account = [ADSI]"WinNT://$env:COMPUTERNAME/$userName,user"
+        $account.Invoke('SetPassword', '')
     } catch {
         Write-Warning "Could not restore the empty password: $($_.Exception.Message)"
     }
@@ -426,6 +428,7 @@ $sddl = Get-ProctorUrlAclSddl
     Set-Content -Path 'C:\ProgramData\proctor\install.json' -Encoding UTF8
 
 Write-Information ''
+Write-Information (& netsh.exe http show urlacl "url=$kioskBase/" | Out-String)
 [gc]::Collect()
 [gc]::WaitForPendingFinalizers()
 Write-Information 'Running uninstall.ps1...'
