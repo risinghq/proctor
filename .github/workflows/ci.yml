@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: blacksmith-2vcpu-windows-2025
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install lint and test modules
+        shell: powershell
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
+          Install-Module PSScriptAnalyzer, Pester -Force -Scope CurrentUser
+
+      - name: PSScriptAnalyzer
+        shell: powershell
+        run: |
+          $findings = Invoke-ScriptAnalyzer -Path . -Recurse -Settings .\PSScriptAnalyzerSettings.psd1
+          $findings | Format-Table RuleName, Severity, ScriptName, Line, Message -AutoSize | Out-String -Width 200
+          if ($findings) { exit 1 }
+
+      - name: Pester unit tests
+        shell: powershell
+        run: |
+          $result = Invoke-Pester -Path .\tests\Proctor.Tests.ps1 -Output Detailed -PassThru
+          if ($result.FailedCount -gt 0) { exit 1 }
+
+      - name: Round trip install and uninstall
+        shell: powershell
+        run: .\tests\RoundTrip.ps1
