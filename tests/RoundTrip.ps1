@@ -19,6 +19,49 @@ function Assert-True {
     Write-Information "  ok: $Message"
 }
 
+function Set-StudentBatchRight {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([Parameter(Mandatory)][string]$AccountSid, [switch]$Revoke)
+
+    $cfg = Join-Path $env:TEMP 'proctor-batch-right.inf'
+    & secedit.exe /export /cfg $cfg /areas USER_RIGHTS | Out-Null
+    $marker = "*$AccountSid"
+    $lines = [System.Collections.Generic.List[string]]@(Get-Content $cfg)
+    $found = $false
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '^\s*SeBatchLogonRight\s*=') {
+            $found = $true
+            $sids = @(($lines[$i] -split '=', 2)[1] -split '\s*,\s*' | Where-Object { $_ })
+            if ($Revoke) {
+                $sids = @($sids | Where-Object { $_ -ne $marker })
+            } elseif ($sids -notcontains $marker) {
+                $sids += $marker
+            }
+            $lines[$i] = "SeBatchLogonRight = $($sids -join ',')"
+        }
+    }
+    if (-not $found -and -not $Revoke) {
+        $idx = $lines.IndexOf('[Privilege Rights]')
+        if ($idx -lt 0) {
+            $lines.Add('[Privilege Rights]')
+            $idx = $lines.Count - 1
+        }
+        $lines.Insert($idx + 1, "SeBatchLogonRight = $marker")
+    }
+    $lines | Set-Content $cfg
+    if ($PSCmdlet.ShouldProcess($AccountSid, 'set SeBatchLogonRight')) {
+        & secedit.exe /configure /db (Join-Path $env:TEMP 'proctor-batch.sdb') /cfg $cfg /areas USER_RIGHTS | Out-Null
+    }
+}
+
+function Get-StudentBatchRight {
+    param([Parameter(Mandatory)][string]$AccountSid)
+    $cfg = Join-Path $env:TEMP 'proctor-batch-check.inf'
+    & secedit.exe /export /cfg $cfg /areas USER_RIGHTS | Out-Null
+    $line = Get-Content $cfg | Where-Object { $_ -match '^\s*SeBatchLogonRight\s*=' }
+    return ($null -ne $line -and $line -match [regex]::Escape("*$AccountSid"))
+}
+
 Import-Module (Join-Path -Path $root -ChildPath 'proctor.psm1') -Force
 
 Write-Information 'Setting up the exam share...'
@@ -105,15 +148,28 @@ $probeTask = 'ProctorFirewallProbe'
 $probeAction = New-ScheduledTaskAction -Execute 'powershell.exe' `
     -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$probeScript`""
 $probePrincipal = New-ScheduledTaskPrincipal -UserId $userName -LogonType S4U -RunLevel Limited
-Register-ScheduledTask -TaskName $probeTask -Action $probeAction -Principal $probePrincipal | Out-Null
-Start-ScheduledTask -TaskName $probeTask
-$deadline = (Get-Date).AddMinutes(2)
-do {
-    Start-Sleep -Seconds 2
-    $probe = Get-ScheduledTask -TaskName $probeTask
-} while ($probe.State -eq 'Running' -and (Get-Date) -lt $deadline)
-if ($probe.State -eq 'Running') { throw 'Probe task still running after 2 minutes' }
-Unregister-ScheduledTask -TaskName $probeTask -Confirm:$false
+
+Set-StudentBatchRight -AccountSid $sid
+try {
+    Register-ScheduledTask -TaskName $probeTask -Action $probeAction -Principal $probePrincipal | Out-Null
+    try {
+        Start-ScheduledTask -TaskName $probeTask
+        $deadline = (Get-Date).AddMinutes(2)
+        do {
+            Start-Sleep -Seconds 2
+            $probe = Get-ScheduledTask -TaskName $probeTask
+        } while ($probe.State -eq 'Running' -and (Get-Date) -lt $deadline)
+        if ($probe.State -eq 'Running') { throw 'Probe task still running after 2 minutes' }
+    }
+    finally {
+        Unregister-ScheduledTask -TaskName $probeTask -Confirm:$false -ErrorAction SilentlyContinue
+    }
+}
+finally {
+    Set-StudentBatchRight -AccountSid $sid -Revoke
+}
+Assert-True (-not (Get-StudentBatchRight -AccountSid $sid)) 'SeBatchLogonRight revoked after the probe'
+
 $probeOut = Get-Content -Path $probeResult -TotalCount 1 -ErrorAction SilentlyContinue
 Write-Information "  probe result: $probeOut"
 Assert-True ($probeOut -eq 'blocked') 'student cannot open TCP 445 to the share host'
