@@ -105,7 +105,7 @@ try {
         $pointer = Join-Path $examRoot 'current.txt'
         Set-Content -Path $tmp -Value $versionName -NoNewline -Encoding ASCII
         if (Test-Path $pointer) {
-            [System.IO.File]::Replace($tmp, $pointer, $null)
+            [System.IO.File]::Replace($tmp, $pointer, [NullString]::Value)
         } else {
             Move-Item -Path $tmp -Destination $pointer -Force
         }
