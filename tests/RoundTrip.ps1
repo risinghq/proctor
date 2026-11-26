@@ -135,7 +135,8 @@ try {
 # Start-Process -Credential logs on without loading the student profile, so
 # the hive stays unloaded and uninstall can delete the profile afterwards.
 $probePasswordPlain = "P!$([guid]::NewGuid().ToString('N').Substring(0, 16))"
-$probePassword = ConvertTo-SecureString $probePasswordPlain -AsPlainText -Force
+$probePassword = New-Object System.Security.SecureString
+foreach ($c in $probePasswordPlain.ToCharArray()) { $probePassword.AppendChar($c) }
 Set-LocalUser -Name $userName -Password $probePassword
 try {
     $probeCredential = New-Object System.Management.Automation.PSCredential($userName, $probePassword)
