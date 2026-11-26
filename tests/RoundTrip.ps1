@@ -34,7 +34,7 @@ New-SmbShare -Name $shareName -Path $shareDir -ReadAccess $shareUser -FullAccess
 & icacls.exe $shareDir /inheritance:r /grant 'Administrators:(OI)(CI)F' /grant 'SYSTEM:(OI)(CI)F' /grant "${shareUser}:(OI)(CI)R" | Out-Null
 
 $shareAccess = (Get-SmbShareAccess -Name $shareName).AccountName
-Assert-True ($shareAccess -notmatch 'Everyone|ANONYMOUS LOGON') 'share allows no Everyone or anonymous access'
+Assert-True (@($shareAccess | Where-Object { $_ -match 'Everyone|ANONYMOUS LOGON' }).Count -eq 0) 'share allows no Everyone or anonymous access'
 
 $configPath = Join-Path -Path $env:TEMP -ChildPath 'proctor-ci.json'
 @{
@@ -107,7 +107,7 @@ do {
     $probe = Get-ScheduledTask -TaskName $probeTask
 } while ($probe.State -eq 'Running' -and (Get-Date) -lt $deadline)
 Unregister-ScheduledTask -TaskName $probeTask -Confirm:$false
-$probeOut = Get-Content -Path $probeResult -ErrorAction SilentlyContinue
+$probeOut = Get-Content -Path $probeResult -TotalCount 1 -ErrorAction SilentlyContinue
 Write-Information "  probe result: $probeOut"
 Assert-True ($probeOut -eq 'blocked') 'student cannot open TCP 445 to the share host'
 
@@ -117,7 +117,7 @@ Assert-True (Test-Path 'C:\Kiosk\sync-exam.ps1') 'sync-exam.ps1 deployed'
 $kioskAcl = Get-Acl -Path 'C:\Kiosk'
 $studentRights = $kioskAcl.Access | Where-Object { $_.IdentityReference -match [regex]::Escape($userName) }
 Assert-True ($null -ne $studentRights) 'student has an explicit ACE on C:\Kiosk'
-Assert-True ($studentRights.FileSystemRights -notmatch 'Write|Modify|FullControl') 'student cannot write C:\Kiosk'
+Assert-True (@($studentRights | Where-Object { $_.FileSystemRights -match 'Write|Modify|FullControl' }).Count -eq 0) 'student cannot write C:\Kiosk'
 
 $credAcl = Get-Acl -Path 'C:\ProgramData\proctor\share.cred'
 $credSids = $credAcl.Access | ForEach-Object { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }
